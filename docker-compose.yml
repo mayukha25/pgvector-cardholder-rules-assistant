@@ -1,0 +1,89 @@
+# Secrets are read from .env (git-ignored) in this directory.
+
+networks:
+  bank-internal:
+    driver: bridge
+
+volumes:
+  pgdata:
+  ollama_storage:
+
+services:
+  # 1. PostgreSQL 18 with pgvector & pgcrypto
+  postgres-ai:
+    image: pgvector/pgvector:pg18
+    container_name: bank_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: bank_aidb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      # Consumed by sql/01_roles.sh on first start of an empty volume
+      LOADER_DB_PASSWORD: ${LOADER_DB_PASSWORD:?set LOADER_DB_PASSWORD in .env}
+      WORKER_DB_PASSWORD: ${WORKER_DB_PASSWORD:?set WORKER_DB_PASSWORD in .env}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./sql:/docker-entrypoint-initdb.d
+    networks:
+      - bank-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bank_aidb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Local Model Runtime (Air-gapped)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: bank_ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    networks:
+      - bank-internal
+
+  # 3. Asynchronous Ingestion & Event Worker
+  #    Enable with: docker compose --profile app up -d  (needs ./workers/Dockerfile)
+  embedding-worker:
+    profiles: ["app"]
+    build:
+      context: ./workers
+    container_name: bank_embedding_worker
+    restart: always
+    depends_on:
+      postgres-ai:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      DB_URI: "dbname=bank_aidb user=embed_worker password=${WORKER_DB_PASSWORD} host=postgres-ai port=5432"
+      OLLAMA_HOST: "http://ollama:11434"
+    networks:
+      - bank-internal
+
+  # 4. MCP Runtime & Orchestration Gateway
+  #    Enable with: docker compose --profile app up -d  (needs ./orchestrator/Dockerfile)
+  orchestrator:
+    profiles: ["app"]
+    build:
+      context: ./orchestrator
+    container_name: bank_orchestrator
+    restart: always
+    depends_on:
+      postgres-ai:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    environment:
+      DB_URI: "dbname=bank_aidb user=mcp_assistant password=${APP_DB_PASSWORD} host=postgres-ai port=5432"
+      OLLAMA_HOST: "http://ollama:11434"
+      CONFIDENCE_THRESHOLD: "0.70"
+    networks:
+      - bank-internal
