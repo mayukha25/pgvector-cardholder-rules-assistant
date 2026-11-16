@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS api.query_embedding_cache (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at  TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours'
 );
+-- Replace the api.chat_audit_log definition in sql/03_embeddings_api.sql with:
 
 CREATE TABLE IF NOT EXISTS api.chat_audit_log (
     log_id              BIGSERIAL PRIMARY KEY,
@@ -80,10 +81,46 @@ CREATE TABLE IF NOT EXISTS api.chat_audit_log (
     matched_rule_ids    TEXT[] NOT NULL DEFAULT '{}',
     similarity_scores   DOUBLE PRECISION[] NOT NULL DEFAULT '{}',
     generated_response  TEXT,
-    execution_status    TEXT NOT NULL CHECK (execution_status IN ('SUCCESS', 'ABSTAINED', 'ERROR')),
+    execution_status    TEXT NOT NULL CHECK (execution_status IN ('SUCCESS', 'ABSTAINED', 'ESCALATED', 'ERROR')),
     latency_ms          INTEGER,
+    prev_hash           TEXT NOT NULL DEFAULT 'GENESIS',
+    record_hash         TEXT NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE OR REPLACE FUNCTION api.chain_audit_log() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = api, public, pg_temp AS $$
+DECLARE
+    last_hash TEXT;
+BEGIN
+    SELECT record_hash INTO last_hash
+    FROM api.chat_audit_log
+    ORDER BY log_id DESC
+    LIMIT 1
+    FOR UPDATE;
+
+    NEW.prev_hash := COALESCE(last_hash, 'GENESIS');
+    NEW.record_hash := encode(
+        digest(
+            NEW.prev_hash || '|' ||
+            NEW.session_id || '|' ||
+            NEW.customer_tier || '|' ||
+            NEW.user_query || '|' ||
+            array_to_string(NEW.matched_rule_ids, ',') || '|' ||
+            NEW.execution_status || '|' ||
+            COALESCE(NEW.generated_response, ''),
+            'sha256'
+        ),
+        'hex'
+    );
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_chain_audit_log ON api.chat_audit_log;
+CREATE TRIGGER trg_chain_audit_log
+    BEFORE INSERT ON api.chat_audit_log
+    FOR EACH ROW EXECUTE FUNCTION api.chain_audit_log();
 
 ------------------------------------------------------------------------------
 -- 4. Least-privilege grants

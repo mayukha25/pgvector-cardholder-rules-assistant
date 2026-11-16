@@ -1,3 +1,4 @@
+-- sql/02_schema.sql
 -- Runs once, after 01_roles.sh, on the first start of an empty database volume.
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -15,7 +16,10 @@ CREATE TABLE IF NOT EXISTS core.bank_rulebook (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Least privilege: the loader writes rules, the worker and assistant only read them.
-GRANT USAGE ON SCHEMA core TO rule_loader, embed_worker, mcp_assistant;
+CREATE INDEX IF NOT EXISTS idx_bank_rulebook_tier_vendor
+    ON core.bank_rulebook (card_tier, vendor_id);
+
+-- Least privilege: loader writes rules, worker reads rules, assistant uses api.rulebook_vw only.
+GRANT USAGE ON SCHEMA core TO rule_loader, embed_worker;
 GRANT SELECT, INSERT, UPDATE ON core.bank_rulebook TO rule_loader;
-GRANT SELECT ON core.bank_rulebook TO embed_worker, mcp_assistant;
+GRANT SELECT ON core.bank_rulebook TO embed_worker;
