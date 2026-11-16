@@ -1,0 +1,4 @@
+FROM llama3.2
+PARAMETER num_ctx 4096
+PARAMETER num_batch 256
+PARAMETER num_gpu 99

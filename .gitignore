@@ -5670,3 +5670,4 @@ venv/lib/python3.12/site-packages/uvicorn-0.28.0.dist-info/RECORD
 venv/lib/python3.12/site-packages/uvicorn-0.28.0.dist-info/REQUESTED
 venv/lib/python3.12/site-packages/uvicorn-0.28.0.dist-info/WHEEL
 venv/lib/python3.12/site-packages/uvicorn-0.28.0.dist-info/licenses/LICENSE.md
+ingestion/__pycache__/parse_disclosure.cpython-312.pyc

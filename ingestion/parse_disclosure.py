@@ -3,6 +3,8 @@ import re
 import json
 import hashlib
 import argparse
+import sys
+import time
 from pathlib import Path
 from typing import List, Literal
 
@@ -37,8 +39,14 @@ DB_URI = (
     f"port={env('DB_PORT', '5432')} "
     f"password={env('LOADER_DB_PASSWORD')}"
 )
-OLLAMA_HOST = env("OLLAMA_HOST", "http://localhost:11434")
+# Use 127.0.0.1, not "localhost": on macOS "localhost" resolves to ::1 first, which is
+# where Docker's bank_ollama container listens (CPU-only inside the VM, very slow).
+# The native Ollama.app listens on 127.0.0.1 and uses the Metal GPU.
+OLLAMA_HOST = env("OLLAMA_HOST", "http://127.0.0.1:11434")
 EXTRACTION_MODEL = env("EXTRACTION_MODEL", "llama3.2:3b")
+LLM_TIMEOUT_S = float(env("LLM_TIMEOUT_S", "300"))   # hard cap per chunk request
+LLM_NUM_CTX = int(env("LLM_NUM_CTX", "8192"))        # prompt + schema + output must fit
+LLM_NUM_PREDICT = int(env("LLM_NUM_PREDICT", "2048")) # stops runaway JSON generation
 
 # Official BIAN Service Domains for Credit Card & Retail Banking Disclosures
 BIAN_DOMAINS = Literal[
@@ -69,8 +77,21 @@ class ExtractedClause(BaseModel):
     )
 
 
+MAX_RULES_PER_CHUNK = int(env("MAX_RULES_PER_CHUNK", "10"))
+
+
 class RuleExtractionBatch(BaseModel):
-    rules: List[ExtractedClause]
+    # maxItems is enforced by Ollama's grammar, so the model cannot loop forever emitting rules
+    rules: List[ExtractedClause] = Field(max_length=MAX_RULES_PER_CHUNK)
+
+
+_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
+
+
+def _is_grounded(clause_text: str, source_text: str) -> bool:
+    """Reject clauses whose numbers (fees, %, days) do not appear in the source chunk."""
+    source_digits = {n.replace(",", "") for n in _NUMBER_RE.findall(source_text)}
+    return all(n.replace(",", "") in source_digits for n in _NUMBER_RE.findall(clause_text))
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +119,39 @@ def read_source_content(source_path_or_url: str) -> str:
     return p.read_text(encoding="utf-8", errors="ignore")
 
 
+def _split_oversized(block: str, max_chars: int) -> List[str]:
+    """Break a block longer than max_chars on line breaks, then sentence ends, then hard cuts."""
+    if len(block) <= max_chars:
+        return [block]
+    for pattern in (r"\n", r"(?<=[.;:])\s+"):
+        parts = [p for p in re.split(pattern, block) if p.strip()]
+        if len(parts) > 1:
+            out, cur = [], ""
+            for part in parts:
+                for piece in _split_oversized(part.strip(), max_chars):
+                    if cur and len(cur) + len(piece) + 1 > max_chars:
+                        out.append(cur)
+                        cur = piece
+                    else:
+                        cur = f"{cur}\n{piece}".strip()
+            if cur:
+                out.append(cur)
+            return out
+    return [block[i:i + max_chars] for i in range(0, len(block), max_chars)]
+
+
 def chunk_document(text: str, max_chars: int = 2200, overlap: int = 300) -> List[str]:
-    """Splits disclosures on section/paragraph boundaries while keeping fee tables intact."""
-    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if len(p.strip()) > 30]
+    """Splits disclosures on section/paragraph boundaries while keeping fee tables intact.
+
+    PDF text often has single newlines only, so a whole page arrives as one "paragraph";
+    those are split further so no chunk exceeds max_chars (+ overlap).
+    """
+    paragraphs = [
+        piece
+        for p in re.split(r"\n{2,}", text)
+        if len(p.strip()) > 30
+        for piece in _split_oversized(p.strip(), max_chars - overlap)
+    ]
     chunks, current = [], ""
 
     for para in paragraphs:
@@ -132,7 +183,9 @@ def extract_rules_from_chunk(
         "CRITICAL RULES:\n"
         "1. Preserve every number, percentage, dollar cap, and time window verbatim.\n"
         "2. Do not invent rules not present in the text.\n"
-        "3. Map each rule to the most accurate BIAN Service Domain."
+        "3. Map each rule to the most accurate BIAN Service Domain.\n"
+        f"4. Return at most {MAX_RULES_PER_CHUNK} rules, each a different clause. Never repeat a rule.\n"
+        "5. If the text has no concrete rule (definitions, headings, boilerplate), return {\"rules\": []}."
     )
 
     res = client.chat(
@@ -142,14 +195,24 @@ def extract_rules_from_chunk(
             {"role": "user", "content": f"DISCLOSURE TEXT:\n{chunk_text}"},
         ],
         format=RuleExtractionBatch.model_json_schema(),
-        options={"temperature": 0.0},
+        options={
+            "temperature": 0.0,
+            "num_ctx": LLM_NUM_CTX,
+            "num_predict": LLM_NUM_PREDICT,
+        },
+        keep_alive="15m",
     )
+    if res.get("done_reason") == "length":
+        raise ValueError(f"output hit num_predict={LLM_NUM_PREDICT} before the JSON closed")
 
     raw_json = res["message"]["content"]
     parsed = RuleExtractionBatch.model_validate_json(raw_json)
 
-    extracted_records = []
+    extracted_records, seen_ids = [], set()
     for item in parsed.rules:
+        if not _is_grounded(item.clause_text, chunk_text):
+            print(f"\n      🚫 dropped ungrounded rule: {item.rule_title!r}", end="", flush=True)
+            continue
         clean_cat = re.sub(r"[^A-Z0-9]", "", item.category_code.upper())[:8] or "GEN"
         # Deterministic content hash so re-running on the same PDF updates in-place
         short_hash = hashlib.sha1(
@@ -157,6 +220,9 @@ def extract_rules_from_chunk(
         ).hexdigest()[:6].upper()
 
         rule_id = f"{vendor_id}-{clean_cat}-{short_hash}"
+        if rule_id in seen_ids:
+            continue
+        seen_ids.add(rule_id)
         extracted_records.append(
             {
                 "rule_id": rule_id,
@@ -204,12 +270,9 @@ Travel Cancellation & Interruption Protection: Reimburses up to $10,000 per cove
 # ---------------------------------------------------------------------------
 # 4. Idempotent PostgreSQL Batch Loader
 # ---------------------------------------------------------------------------
-def load_rules(rules: List[dict]):
+def load_rules(conn, rules: List[dict]):
     if not rules:
-        print("⚠️ No rules extracted to load.")
         return
-
-    conn = psycopg2.connect(DB_URI)
     cur = conn.cursor()
     upsert_sql = """
         INSERT INTO core.bank_rulebook (
@@ -226,12 +289,39 @@ def load_rules(rules: List[dict]):
             clause_text = EXCLUDED.clause_text,
             updated_at  = NOW();
     """
-    execute_batch(cur, upsert_sql, rules, page_size=50)
-    conn.commit()
-    conn.close()
+    try:
+        execute_batch(cur, upsert_sql, rules, page_size=50)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
     for r in rules:
-        print(f"📄 Upserted [{r['bian_domain']}] {r['rule_id']} -> {r['rule_title']}")
-    print(f"✅ Loaded {len(rules)} rules into core.bank_rulebook (NOTIFY events emitted).")
+        print(f"      📄 [{r['bian_domain']}] {r['rule_id']} -> {r['rule_title']}")
+
+
+def preflight(client: ollama.Client) -> None:
+    """Fail fast if Ollama is unreachable or the model is missing, and warn on CPU-only inference."""
+    try:
+        names = {m["model"] for m in client.list()["models"]}
+    except Exception as e:
+        sys.exit(f"❌ Cannot reach Ollama at {OLLAMA_HOST}: {e}")
+    wanted = EXTRACTION_MODEL if ":" in EXTRACTION_MODEL else f"{EXTRACTION_MODEL}:latest"
+    if wanted not in names:
+        sys.exit(
+            f"❌ Model '{EXTRACTION_MODEL}' not found on {OLLAMA_HOST}. "
+            f"Available: {sorted(names)}. Run `ollama pull {EXTRACTION_MODEL}` or set EXTRACTION_MODEL."
+        )
+    print(f"🔌 Ollama {OLLAMA_HOST} | model {EXTRACTION_MODEL} | warming up...", flush=True)
+    t0 = time.monotonic()
+    client.generate(model=EXTRACTION_MODEL, prompt="", keep_alive="15m")
+    loaded = [m for m in client.ps()["models"] if m["model"] == wanted]
+    gpu = loaded and loaded[0].get("size_vram", 0) > 0
+    print(f"   model ready in {time.monotonic() - t0:.1f}s ({'GPU' if gpu else 'CPU only'})", flush=True)
+    if not gpu:
+        print("   ⚠️ Model is running on CPU; extraction will be slow. "
+              "If this is the Docker container, point OLLAMA_HOST at the native Ollama.app.", flush=True)
 
 
 def main():
@@ -242,7 +332,8 @@ def main():
     parser.add_argument("--vendor", type=str, default="CHASE", help="Issuing vendor ID (e.g., CHASE, AMEX, ANZ)")
     args = parser.parse_args()
 
-    client = ollama.Client(host=OLLAMA_HOST)
+    client = ollama.Client(host=OLLAMA_HOST, timeout=LLM_TIMEOUT_S)
+    preflight(client)
     sources_to_process = []
 
     if args.source:
@@ -255,18 +346,33 @@ def main():
         print("ℹ️ No --source or --dir specified; extracting exhaustive rules from built-in Schumer Box & Bulletin corpus...")
         sources_to_process.append(("built_in_schumer_corpus", SYNTHETIC_DISCLOSURE_CORPUS))
 
-    all_extracted = {}
-    for src_name, raw_text in sources_to_process:
-        chunks = chunk_document(raw_text)
-        print(f"🔍 Parsing '{src_name}' ({len(chunks)} chunks) via {EXTRACTION_MODEL}...")
-        for idx, chunk in enumerate(chunks, start=1):
-            print(f"   ⚙️ Extracting chunk {idx}/{len(chunks)}...")
-            try:
-                batch = extract_rules_from_chunk(client, chunk, args.tier, args.vendor)
-                if batch:
-                    load_rules(batch)  # Upserts immediately so progress is saved per chunk
-            except Exception as e:
-                print(f"   ⚠️ Skipped chunk {idx} due to parse error: {e}"  )
+    conn = psycopg2.connect(DB_URI)
+    total_rules, failed, run_start = 0, [], time.monotonic()
+    try:
+        for src_name, raw_text in sources_to_process:
+            chunks = chunk_document(raw_text)
+            print(f"🔍 Parsing '{src_name}' ({len(chunks)} chunks) via {EXTRACTION_MODEL}...", flush=True)
+            for idx, chunk in enumerate(chunks, start=1):
+                print(f"   ⚙️ Chunk {idx}/{len(chunks)} ({len(chunk)} chars)...", end=" ", flush=True)
+                t0 = time.monotonic()
+                try:
+                    batch = extract_rules_from_chunk(client, chunk, args.tier, args.vendor)
+                except Exception as e:
+                    print(f"skipped after {time.monotonic() - t0:.1f}s: {type(e).__name__}: {e}", flush=True)
+                    failed.append((src_name, idx))
+                    continue
+                print(f"{len(batch)} rules in {time.monotonic() - t0:.1f}s", flush=True)
+                load_rules(conn, batch)  # Upserts immediately so progress is saved per chunk
+                total_rules += len(batch)
+    except KeyboardInterrupt:
+        print("\n⏹️ Interrupted; rules from completed chunks are already saved.")
+    finally:
+        conn.close()
+
+    print(f"✅ Upserted {total_rules} rules into core.bank_rulebook in {time.monotonic() - run_start:.0f}s.")
+    if failed:
+        print(f"⚠️ {len(failed)} chunk(s) failed: {failed}")
+
 
 if __name__ == "__main__":
     main()
