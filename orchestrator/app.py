@@ -15,8 +15,6 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.70"))
 EMBED_MODEL = "nomic-embed-text"
 CHAT_MODEL = "llama3.2:3b"
-INJECTION_PATTERNS = ("ignore previous", "system prompt", "bypass", "override rule", "disregard")
-ESCALATION_PATTERNS = ("waive my fee", "refund my", "reverse the charge", "cancel my penalty", "dispute")
 
 client = ollama.Client(host=OLLAMA_HOST)
 
@@ -28,30 +26,18 @@ class ChatRequest(BaseModel):
 
 def get_query_vector(cur, query_text: str):
     q_hash = hashlib.sha256(query_text.strip().lower().encode("utf-8")).hexdigest()
-    cur.execute(
-        """
-        SELECT embedding
-        FROM api.query_embedding_cache
-        WHERE query_hash = %s
-          AND model_id = %s
-          AND expires_at > NOW();
-        """,
-        (q_hash, EMBED_MODEL),  # <-- Must have 2 items to match the 2 %s placeholders
-    )
+    cur.execute("SELECT embedding FROM api.query_embedding_cache WHERE query_hash = %s AND expires_at > NOW();", (q_hash,))
     cached = cur.fetchone()
     if cached:
         return cached["embedding"]
 
     res = client.embeddings(model=EMBED_MODEL, prompt=query_text)
     vec = res["embedding"]
-    cur.execute(
-        """
+    cur.execute("""
         INSERT INTO api.query_embedding_cache (query_hash, raw_query, model_id, embedding)
         VALUES (%s, %s, %s, %s::vector)
         ON CONFLICT (query_hash) DO NOTHING;
-        """,
-        (q_hash, query_text, EMBED_MODEL, vec),  # <-- 4 items for 4 %s placeholders
-    )
+    """, (q_hash, query_text, EMBED_MODEL, vec))
     return vec
 
 @app.post("/api/v1/chat")
@@ -135,11 +121,3 @@ def handle_chat(req: ChatRequest):
         "latency_ms": latency,
         "response": final_text
     }
-
-def check_guardrails(query_text: str):
-    q_lower = query_text.lower()
-    if any(p in q_lower for p in INJECTION_PATTERNS):
-        return "ABSTAINED", "Request blocked by security guardrail: instruction override detected."
-    if any(p in q_lower for p in ESCALATION_PATTERNS):
-        return "ESCALATED", "High-impact account action requested (fee waiver/refund/dispute). Escalating inquiry to a human specialist with full context."
-    return None, None

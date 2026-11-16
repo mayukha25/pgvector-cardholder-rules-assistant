@@ -49,12 +49,9 @@ def load_rules(rules):
         INSERT INTO core.bank_rulebook (rule_id, bian_domain, card_tier, vendor_id, rule_title, clause_text)
         VALUES (%(rule_id)s, %(bian_domain)s, %(card_tier)s, %(vendor_id)s, %(rule_title)s, %(clause_text)s)
         ON CONFLICT (rule_id) DO UPDATE SET
-            bian_domain = EXCLUDED.bian_domain,
-            card_tier   = EXCLUDED.card_tier,
-            vendor_id   = EXCLUDED.vendor_id,
-            rule_title  = EXCLUDED.rule_title,
             clause_text = EXCLUDED.clause_text,
-            updated_at  = NOW();
+            rule_title = EXCLUDED.rule_title,
+            updated_at = NOW();
     """
     for r in rules:
         cur.execute(upsert_sql, r)
