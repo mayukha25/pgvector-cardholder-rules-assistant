@@ -54,7 +54,7 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 | Role | Used by | Can do |
 |---|---|---|
 | `postgres` | Admin / init scripts only | Everything |
-| `rule_loader` | `ingestion/parse_disclosure.py` | Insert and update rules in `core.bank_rulebook` |
+| `rule_loader` | `ingestion/parse_disclosure.py` | Insert, update and prune (delete) rules in `core.bank_rulebook` |
 | `embed_worker` | `workers/embedding_worker.py` | Read rules; write only `embedding`/`updated_at`; update jobs; truncate the query cache |
 | `mcp_assistant` | `orchestrator/app.py` | Read rules **only through** `api.rulebook_vw`; use the query cache; append to the audit log. 2-second statement timeout |
 
@@ -301,9 +301,20 @@ docker exec bank_postgres psql -U postgres -d bank_aidb -c "
 
 ### Adding or changing rules
 
-1. Edit `SAMPLE_EXTRACTED_RULES` in [ingestion/parse_disclosure.py](ingestion/parse_disclosure.py). Each rule needs `rule_id`, `bian_domain`, `card_tier`, `vendor_id`, `rule_title` and `clause_text`.
-2. Run `python ingestion/parse_disclosure.py`.
-3. The trigger re-queues only rules that are new, whose title, domain or clause text changed, or that have no embedding yet. The worker re-embeds them and clears the query cache, so the next questions use the new rules immediately.
+Ingest a document (PDF, TXT, MD or URL), or a whole folder with `--dir`:
+
+```zsh
+python ingestion/parse_disclosure.py --source ~/Downloads/agreement.pdf --vendor HDFC --tier international_credit
+```
+
+Re-running on the same document is safe:
+
+- **One row per clause.** `rule_id` is `{vendor}-{hash of vendor, tier and normalized clause text}`. The same clause always maps to the same row, even when the model picks a different title or category. Category is stored in its own `category_code` column.
+- **Stale rules are pruned per document.** Each run stamps `last_seen_at` on every rule it extracts. When a document finishes with no failed chunks, rules of that vendor, tier and `source_doc` that the run did not see are deleted. Other documents are never touched. Pass `--no-prune` to keep them.
+- **Failures defer the prune.** If any chunk of a document fails, nothing is pruned for it. The run prints a `--retry-failed <run_dir>` command. Once the retry clears the failures, the deferred prune runs. An interrupted run never prunes, and a run that saved 0 rules for a document refuses to prune it.
+- **Embeddings only redo what changed.** The trigger re-queues only rules that are new, whose title, domain or clause text changed, or that have no embedding yet. The worker re-embeds them and clears the query cache, so the next questions use the new rules immediately.
+
+Every run writes `logs/<DD-Mon-YYYY_HH-MM-SS_id>/run.jsonl`. Each failed chunk gets a JSON file in that run's `failed/` folder with the chunk text and the model's raw output.
 
 ### Changing worker or orchestrator code
 
@@ -342,10 +353,24 @@ docker exec -it bank_postgres psql -U postgres -d bank_aidb   # SQL shell
 | `LOADER_DB_PASSWORD` | `.env` | generated | `rule_loader` password (ingestion script) |
 | `WORKER_DB_PASSWORD` | `.env` | generated | `embed_worker` password (worker container) |
 | `APP_DB_PASSWORD` | `.env` | generated | `mcp_assistant` password (orchestrator container) |
+| `OLLAMA_HOST` | `.env` (set by `./ollama-mode.sh`) | `http://127.0.0.1:11434` | Ollama used by the ingestion script. `127.0.0.1` is the native Ollama.app (GPU). `[::1]` is the `bank_ollama` container (CPU) |
+| `CONTAINER_OLLAMA_HOST` | `.env` (set by `./ollama-mode.sh`) | `http://ollama:11434` | Ollama used by the worker and orchestrator. `host.docker.internal` is Ollama.app (GPU). `ollama` is the container (CPU) |
 | `CONFIDENCE_THRESHOLD` | `docker-compose.yml` → `orchestrator` | `0.70` | Minimum cosine similarity needed to answer |
 | `EMBED_MODEL` / `MODEL_ID` | `orchestrator/app.py` / `workers/embedding_worker.py` | `nomic-embed-text` | Must match in both files, and must output 768 dimensions (or change `vector(768)` in `sql/03_embeddings_api.sql`) |
 | `CHAT_MODEL` | `orchestrator/app.py` | `llama3.2:3b` | Model that writes the answers |
 | Query cache TTL | `sql/03_embeddings_api.sql` | 24 hours | How long question embeddings are reused |
+
+### Switching between GPU and CPU
+
+Docker on macOS cannot use the Apple GPU. For GPU inference, point everything at the native Ollama.app:
+
+```zsh
+./ollama-mode.sh gpu      # ingestion, embeddings and answers on Ollama.app (Metal GPU); pulls missing models
+./ollama-mode.sh cpu      # everything on the bank_ollama container (CPU)
+./ollama-mode.sh status   # current settings, plus `ollama ps` for both servers (PROCESSOR column = GPU/CPU)
+```
+
+The script updates the two `.env` keys above and recreates only the worker and orchestrator containers. Embeddings come from the same `nomic-embed-text` model in both modes, so existing vectors stay valid.
 
 ### Tuning the confidence threshold
 

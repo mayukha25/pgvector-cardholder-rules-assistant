@@ -62,7 +62,12 @@ services:
         condition: service_started
     environment:
       DB_URI: "dbname=bank_aidb user=embed_worker password=${WORKER_DB_PASSWORD} host=postgres-ai port=5432"
-      OLLAMA_HOST: "http://ollama:11434"
+      # GPU/CPU switch: ./ollama-mode.sh gpu|cpu sets CONTAINER_OLLAMA_HOST in .env.
+      #   gpu -> http://host.docker.internal:11434 (native Ollama.app on the Mac, Metal GPU)
+      #   cpu -> http://ollama:11434               (the bank_ollama container, CPU only)
+      OLLAMA_HOST: "${CONTAINER_OLLAMA_HOST:-http://ollama:11434}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - bank-internal
 
@@ -83,7 +88,9 @@ services:
       - "8000:8000"
     environment:
       DB_URI: "dbname=bank_aidb user=mcp_assistant password=${APP_DB_PASSWORD} host=postgres-ai port=5432"
-      OLLAMA_HOST: "http://ollama:11434"
+      OLLAMA_HOST: "${CONTAINER_OLLAMA_HOST:-http://ollama:11434}"   # see embedding-worker
       CONFIDENCE_THRESHOLD: "0.70"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     networks:
       - bank-internal

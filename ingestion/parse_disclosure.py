@@ -3,8 +3,13 @@ import re
 import json
 import hashlib
 import argparse
+import logging
 import sys
 import time
+import traceback
+import unicodedata
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Literal
 
@@ -14,6 +19,7 @@ from pypdf import PdfReader
 from pydantic import BaseModel, Field
 import ollama
 import requests
+import httpx
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 
@@ -47,6 +53,139 @@ EXTRACTION_MODEL = env("EXTRACTION_MODEL", "llama3.2:3b")
 LLM_TIMEOUT_S = float(env("LLM_TIMEOUT_S", "300"))   # hard cap per chunk request
 LLM_NUM_CTX = int(env("LLM_NUM_CTX", "8192"))        # prompt + schema + output must fit
 LLM_NUM_PREDICT = int(env("LLM_NUM_PREDICT", "2048")) # stops runaway JSON generation
+LOG_DIR = Path(env("LOG_DIR", str(Path(__file__).resolve().parent.parent / "logs")))
+LOG_LEVEL = env("LOG_LEVEL", "INFO")
+
+# ---------------------------------------------------------------------------
+# 0. Execution Logging
+#    - console: concise, human-readable progress (LOG_LEVEL / --log-level)
+#    - logs/<run_id>/run.jsonl: every event at DEBUG, one JSON object per line,
+#      tagged with run_id/source/chunk so a single failure can be traced end to end
+#    - logs/<run_id>/failed/: chunk text + raw LLM output for every failed chunk
+# ---------------------------------------------------------------------------
+log = logging.getLogger("ingest")
+_CTX: dict = {}  # run_id / source / chunk, stamped onto every log record
+
+
+class _ContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        for k, v in _CTX.items():
+            if not hasattr(record, k):
+                setattr(record, k, v)
+        where = [str(_CTX[k]) for k in ("source", "chunk") if k in _CTX]
+        record.where = f"[{' #'.join(where)}] " if where else ""
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    _STD = set(vars(logging.makeLogRecord({}))) | {"message", "asctime", "where"}
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "func": f"{record.funcName}:{record.lineno}",
+            "msg": record.getMessage(),
+        }
+        payload.update({k: v for k, v in vars(record).items() if k not in self._STD})
+        if record.exc_info:
+            payload["exc_type"] = record.exc_info[0].__name__
+            payload["traceback"] = self.formatException(record.exc_info)
+        return json.dumps(payload, default=str, ensure_ascii=False)
+
+
+class _ConsoleFormatter(logging.Formatter):
+    """Keeps the terminal readable: tracebacks only at DEBUG (they always go to run.jsonl)."""
+
+    def __init__(self, show_tracebacks: bool):
+        super().__init__("%(asctime)s %(levelname)-7s %(where)s%(message)s", "%H:%M:%S")
+        self.show_tracebacks = show_tracebacks
+
+    def format(self, record: logging.LogRecord) -> str:
+        if self.show_tracebacks or not record.exc_info:
+            return super().format(record)
+        saved = record.exc_info, record.exc_text
+        record.exc_info = record.exc_text = None
+        try:
+            return super().format(record)
+        finally:
+            record.exc_info, record.exc_text = saved
+
+
+def _short(err: BaseException, limit: int = 200) -> str:
+    """One-line error summary for the console; full detail lives in run.jsonl."""
+    first = (str(err).strip().splitlines() or [""])[0]
+    msg = f"{type(err).__name__}: {first}"
+    return msg if len(msg) <= limit else msg[:limit] + "…"
+
+
+def setup_logging(level: str) -> Path:
+    # e.g. 17-Nov-2026_21-13-08_c29314 (day-month-year, 24-hour time; the suffix keeps same-second runs apart)
+    run_id = f"{datetime.now():%d-%b-%Y_%H-%M-%S}_{uuid.uuid4().hex[:6]}"
+    run_dir = LOG_DIR / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _CTX["run_id"] = run_id
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(level.upper())
+    console.setFormatter(_ConsoleFormatter(show_tracebacks=level.upper() == "DEBUG"))
+    logfile = logging.FileHandler(run_dir / "run.jsonl", encoding="utf-8")
+    logfile.setLevel(logging.DEBUG)
+    logfile.setFormatter(_JsonFormatter())
+    for h in (console, logfile):
+        h.addFilter(_ContextFilter())
+        log.addHandler(h)
+    log.setLevel(logging.DEBUG)
+    log.propagate = False
+    return run_dir
+
+
+def save_failure_artifact(run_dir: Path, source: str, chunk_idx, chunk_text: str, err: Exception,
+                          vendor: str = None, tier: str = None, stage: str = "extract") -> Path:
+    """Persist everything needed to reproduce a failed chunk offline."""
+    out_dir = run_dir / "failed"
+    out_dir.mkdir(exist_ok=True)
+    safe_src = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(source).name)[:60]
+    label = f"{chunk_idx:04d}" if isinstance(chunk_idx, int) else str(chunk_idx)
+    path = out_dir / f"{safe_src}.chunk{label}.json"
+    path.write_text(json.dumps({
+        "run_id": _CTX.get("run_id"),
+        "source": source,
+        "chunk": chunk_idx,
+        "vendor": vendor,
+        "tier": tier,
+        "stage": stage,
+        "model": EXTRACTION_MODEL,
+        "error": f"{type(err).__name__}: {err}",
+        "attempts": getattr(err, "attempts", None),
+        "traceback": traceback.format_exception(err),
+        "llm_done_reason": getattr(err, "done_reason", None),
+        "llm_raw_output": getattr(err, "raw_output", None),
+        "chunk_text": chunk_text,
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+class ExtractionError(Exception):
+    """LLM call succeeded but its output was unusable; carries the raw output for debugging."""
+
+    def __init__(self, msg: str, raw_output: str = None, done_reason: str = None):
+        super().__init__(msg)
+        self.raw_output = raw_output
+        self.done_reason = done_reason
+
+
+def _llm_metrics(res) -> dict:
+    ns = 1e9
+    eval_s = (res.get("eval_duration") or 0) / ns
+    return {
+        "prompt_tokens": res.get("prompt_eval_count"),
+        "output_tokens": res.get("eval_count"),
+        "llm_total_s": round((res.get("total_duration") or 0) / ns, 2),
+        "llm_load_s": round((res.get("load_duration") or 0) / ns, 2),
+        "tokens_per_s": round(res["eval_count"] / eval_s, 1) if res.get("eval_count") and eval_s else None,
+        "done_reason": res.get("done_reason"),
+    }
 
 # Official BIAN Service Domains for Credit Card & Retail Banking Disclosures
 BIAN_DOMAINS = Literal[
@@ -62,17 +201,28 @@ BIAN_DOMAINS = Literal[
 ]
 
 
+# Closed set, enforced by Ollama's grammar. A free-text field let the model write
+# "BIAN Service Domain: 4.1.1.1..." here and loop until num_predict ran out.
+CATEGORY_CODES = Literal[
+    "APR", "FEE", "FX", "PAYMENT", "BILLING", "DISPUTE", "LIMIT", "REWARD", "FRAUD", "GRACE",
+    "LIABILITY", "SECURITY", "CARDMGMT", "LEGAL", "PRIVACY", "GENERAL",
+]
+
+
 class ExtractedClause(BaseModel):
-    category_code: str = Field(
-        description="Short uppercase code such as APR, FEE, FX, DISPUTE, LIMIT, REWARD, FRAUD, or GRACE"
+    category_code: CATEGORY_CODES = Field(
+        description="Rule category: APR, FEE, FX, PAYMENT, BILLING, DISPUTE, LIMIT, REWARD, FRAUD, GRACE, "
+                    "LIABILITY, SECURITY, CARDMGMT, LEGAL, PRIVACY or GENERAL"
     )
     bian_domain: BIAN_DOMAINS = Field(
         description="The closest matching BIAN Service Domain for this credit card rule"
     )
     rule_title: str = Field(
+        max_length=150,
         description="Concise, specific title for the policy rule (e.g., 'Cash Advance APR & Fee')"
     )
     clause_text: str = Field(
+        max_length=2000,  # caps a runaway clause; verbatim rules from a ~2.2k-char chunk fit easily
         description="Exact, self-contained policy rule preserving all percentages, dollar amounts, time windows, and conditions verbatim."
     )
 
@@ -88,6 +238,24 @@ class RuleExtractionBatch(BaseModel):
 _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)*")
 
 
+def _normalize_clause(text: str) -> str:
+    """Canonical form for identity: case, quotes, whitespace and trailing punctuation don't matter."""
+    t = unicodedata.normalize("NFKC", text).lower()
+    t = re.sub(r"[\"'\u2018\u2019\u201c\u201d`]", "", t)
+    return re.sub(r"\s+", " ", t).strip(" .;:,")
+
+
+def make_rule_id(vendor_id: str, card_tier: str, clause_text: str) -> str:
+    """Same clause -> same id, whatever title or category the model picks on a given run.
+
+    Category and title are deliberately NOT part of the id: the model varies them between runs,
+    which used to create duplicate rows (and identical titles on different clauses overwrote
+    each other). 12 hex chars = 48 bits, so collisions are negligible at rulebook scale.
+    """
+    digest = hashlib.sha1(f"{vendor_id}|{card_tier}|{_normalize_clause(clause_text)}".encode("utf-8"))
+    return f"{vendor_id}-{digest.hexdigest()[:12].upper()}"
+
+
 def _is_grounded(clause_text: str, source_text: str) -> bool:
     """Reject clauses whose numbers (fees, %, days) do not appear in the source chunk."""
     source_digits = {n.replace(",", "") for n in _NUMBER_RE.findall(source_text)}
@@ -99,17 +267,24 @@ def _is_grounded(clause_text: str, source_text: str) -> bool:
 # ---------------------------------------------------------------------------
 def read_pdf_text(pdf_path: Path) -> str:
     reader = PdfReader(str(pdf_path))
-    pages = []
+    pages, empty = [], []
     for idx, page in enumerate(reader.pages, start=1):
         txt = page.extract_text() or ""
         if txt.strip():
             pages.append(f"--- [Page {idx}] ---\n{txt}")
+        else:
+            empty.append(idx)
+    log.debug("pdf read", extra={"pages": len(reader.pages), "empty_pages": empty})
+    if empty:
+        log.warning("%d/%d PDF page(s) had no extractable text (scanned images?): %s",
+                    len(empty), len(reader.pages), empty[:20])
     return "\n\n".join(pages)
 
 
 def read_source_content(source_path_or_url: str) -> str:
     if source_path_or_url.startswith(("http://", "https://")):
         resp = requests.get(source_path_or_url, timeout=15)
+        log.debug("http fetch", extra={"status": resp.status_code, "bytes": len(resp.content)})
         resp.raise_for_status()
         return resp.text
 
@@ -175,6 +350,7 @@ def extract_rules_from_chunk(
     chunk_text: str,
     card_tier: str,
     vendor_id: str,
+    options: dict = None,
 ) -> List[dict]:
     system_prompt = (
         "You are a Principal Banking Data Architect specializing in BIAN and TOGAF standards. "
@@ -199,33 +375,39 @@ def extract_rules_from_chunk(
             "temperature": 0.0,
             "num_ctx": LLM_NUM_CTX,
             "num_predict": LLM_NUM_PREDICT,
+            **(options or {}),
         },
         keep_alive="15m",
     )
-    if res.get("done_reason") == "length":
-        raise ValueError(f"output hit num_predict={LLM_NUM_PREDICT} before the JSON closed")
-
     raw_json = res["message"]["content"]
-    parsed = RuleExtractionBatch.model_validate_json(raw_json)
+    metrics = _llm_metrics(res)
+    log.debug("llm response", extra={**metrics, "raw_output": raw_json})
+    if res.get("done_reason") == "length":
+        raise ExtractionError(
+            f"output hit num_predict={LLM_NUM_PREDICT} before the JSON closed",
+            raw_output=raw_json, done_reason="length",
+        )
+    try:
+        parsed = RuleExtractionBatch.model_validate_json(raw_json)
+    except ValueError as e:  # pydantic.ValidationError subclasses ValueError
+        raise ExtractionError(f"LLM output failed schema validation: {e}",
+                              raw_output=raw_json, done_reason=res.get("done_reason")) from e
 
     extracted_records, seen_ids = [], set()
     for item in parsed.rules:
         if not _is_grounded(item.clause_text, chunk_text):
-            print(f"\n      🚫 dropped ungrounded rule: {item.rule_title!r}", end="", flush=True)
+            log.warning("dropped ungrounded rule: %r", item.rule_title,
+                        extra={"clause_text": item.clause_text})
             continue
-        clean_cat = re.sub(r"[^A-Z0-9]", "", item.category_code.upper())[:8] or "GEN"
-        # Deterministic content hash so re-running on the same PDF updates in-place
-        short_hash = hashlib.sha1(
-            f"{vendor_id}:{card_tier}:{item.rule_title.lower().strip()}".encode("utf-8")
-        ).hexdigest()[:6].upper()
-
-        rule_id = f"{vendor_id}-{clean_cat}-{short_hash}"
+        rule_id = make_rule_id(vendor_id, card_tier, item.clause_text)
         if rule_id in seen_ids:
+            log.debug("dropped duplicate rule %s (%r)", rule_id, item.rule_title)
             continue
         seen_ids.add(rule_id)
         extracted_records.append(
             {
                 "rule_id": rule_id,
+                "category_code": item.category_code,
                 "bian_domain": item.bian_domain,
                 "card_tier": card_tier,
                 "vendor_id": vendor_id,
@@ -233,7 +415,112 @@ def extract_rules_from_chunk(
                 "clause_text": item.clause_text.strip(),
             }
         )
+    log.debug("chunk extraction stats", extra={
+        **metrics, "llm_rules": len(parsed.rules), "kept_rules": len(extracted_records),
+    })
     return extracted_records
+
+
+# Errors worth retrying with different settings. Connection refused / model missing are not:
+# those fail identically every time, so they surface immediately.
+RETRYABLE = (ExtractionError, httpx.TimeoutException)
+RETRY_ATTEMPTS = int(env("RETRY_ATTEMPTS", "3"))  # 1 disables retries
+
+
+def extract_with_retries(client, chunk_text: str, card_tier: str, vendor_id: str):
+    """Retry ladder for a chunk whose extraction failed.
+
+    1. default     - temperature 0 (deterministic, so repeating it alone is pointless)
+    2. resample    - temperature 0.3 + repeat_penalty + new seed: escapes degenerate loops
+    3. split       - halve the chunk and extract each half; less input, less output per call
+
+    Returns (records, failed_parts). failed_parts is non-empty only when 'split' recovered some
+    parts but not others: [(part_text, error), ...], so the caller can save them for a later retry.
+    On total failure the raised error carries every attempt's raw output (err.attempts)
+    so the failure artifact shows how each strategy went wrong.
+    """
+    ladder = [
+        ("default", None),
+        ("resample", {"temperature": 0.3, "repeat_penalty": 1.15, "seed": 42}),
+        ("split", {"temperature": 0.2, "repeat_penalty": 1.15, "seed": 7}),
+    ][:max(1, RETRY_ATTEMPTS)]
+    attempts = []
+    for n, (strategy, opts) in enumerate(ladder, start=1):
+        t0 = time.monotonic()
+        try:
+            if strategy == "split":
+                records, failed_parts = _extract_split(client, chunk_text, card_tier, vendor_id, opts)
+            else:
+                records, failed_parts = extract_rules_from_chunk(client, chunk_text, card_tier, vendor_id, opts), []
+        except RETRYABLE as e:
+            attempts.append({"attempt": n, "strategy": strategy, "error": _short(e, 500),
+                             "raw_output": getattr(e, "raw_output", None),
+                             "seconds": round(time.monotonic() - t0, 1)})
+            more = n < len(ladder)
+            log.warning("attempt %d/%d (%s) failed: %s%s", n, len(ladder), strategy, _short(e),
+                        f" -> retrying with '{ladder[n][0]}'" if more else "",
+                        extra={"attempt": n, "strategy": strategy})
+            if not more:
+                e.attempts = attempts
+                raise
+            continue
+        if n > 1:
+            log.info("♻️ recovered on attempt %d (%s)", n, strategy,
+                     extra={"attempt": n, "strategy": strategy, "recovered": True})
+        return records, failed_parts
+
+
+def _extract_split(client, chunk_text: str, card_tier: str, vendor_id: str, opts: dict):
+    """Extract from halves of the chunk; keep what succeeds, fail only if every part fails."""
+    parts = _split_oversized(chunk_text, max(400, len(chunk_text) // 2 + 100))
+    if len(parts) < 2:
+        raise ExtractionError("chunk could not be split further")
+    records, failed_parts = {}, []
+    for i, part in enumerate(parts, start=1):
+        try:
+            for r in extract_rules_from_chunk(client, part, card_tier, vendor_id, opts):
+                records.setdefault(r["rule_id"], r)
+        except RETRYABLE as e:
+            failed_parts.append((part, e))
+            log.warning("split part %d/%d failed: %s", i, len(parts), _short(e))
+    if len(failed_parts) == len(parts):
+        raise failed_parts[-1][1]
+    if failed_parts:
+        log.warning("⚠️ partial recovery: %d/%d split part(s) failed; kept %d rule(s) from the rest",
+                    len(failed_parts), len(parts), len(records), extra={"partial": True})
+    return list(records.values()), failed_parts
+
+
+def _record_failed_parts(run_dir, failed, source, chunk_label, failed_parts, vendor, tier):
+    """Save split parts that could not be extracted so --retry-failed can pick them up."""
+    for i, (part, err) in enumerate(failed_parts, start=1):
+        label = f"{chunk_label}.p{i}"
+        artifact = save_failure_artifact(run_dir, source, label, part, err, vendor, tier)
+        log.error("❌ split part %s lost: %s | details: %s", label, _short(err), artifact,
+                  extra={"artifact": str(artifact)})
+        failed.append({"source": source, "chunk": label, "stage": "extract",
+                       "error": f"{type(err).__name__}: {err}", "artifact": str(artifact)})
+
+
+def load_failed_chunks(prev_run_dir: Path):
+    """Read failure artifacts from a previous run, plus that run's vendor/tier as a fallback."""
+    prev_args = {}
+    jsonl = prev_run_dir / "run.jsonl"
+    if jsonl.exists():
+        for line in jsonl.open(encoding="utf-8"):
+            rec = json.loads(line)
+            if rec.get("cli_args"):
+                prev_args = rec["cli_args"]
+                break
+    items = []
+    for f in sorted((prev_run_dir / "failed").glob("*.json")):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        items.append({
+            "artifact": str(f), "source": d["source"], "chunk": d["chunk"], "chunk_text": d["chunk_text"],
+            "vendor": d.get("vendor") or prev_args.get("vendor"),
+            "tier": d.get("tier") or prev_args.get("tier"),
+        })
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -270,108 +557,386 @@ Travel Cancellation & Interruption Protection: Reimburses up to $10,000 per cove
 # ---------------------------------------------------------------------------
 # 4. Idempotent PostgreSQL Batch Loader
 # ---------------------------------------------------------------------------
-def load_rules(conn, rules: List[dict]):
+def load_rules(conn, rules: List[dict], source_doc: str):
+    """Upsert by content id. last_seen_at always moves (drives pruning); updated_at only on real change."""
     if not rules:
         return
+    rules = [{**r, "source_doc": source_doc} for r in rules]
     cur = conn.cursor()
     upsert_sql = """
-        INSERT INTO core.bank_rulebook (
-            rule_id, bian_domain, card_tier, vendor_id, rule_title, clause_text
+        INSERT INTO core.bank_rulebook AS rb (
+            rule_id, category_code, bian_domain, card_tier, vendor_id, source_doc,
+            rule_title, clause_text, last_seen_at
         )
         VALUES (
-            %(rule_id)s, %(bian_domain)s, %(card_tier)s, %(vendor_id)s, %(rule_title)s, %(clause_text)s
+            %(rule_id)s, %(category_code)s, %(bian_domain)s, %(card_tier)s, %(vendor_id)s, %(source_doc)s,
+            %(rule_title)s, %(clause_text)s, NOW()
         )
         ON CONFLICT (rule_id) DO UPDATE SET
-            bian_domain = EXCLUDED.bian_domain,
-            card_tier   = EXCLUDED.card_tier,
-            vendor_id   = EXCLUDED.vendor_id,
-            rule_title  = EXCLUDED.rule_title,
-            clause_text = EXCLUDED.clause_text,
-            updated_at  = NOW();
+            category_code = EXCLUDED.category_code,
+            bian_domain   = EXCLUDED.bian_domain,
+            source_doc    = EXCLUDED.source_doc,
+            rule_title    = EXCLUDED.rule_title,
+            clause_text   = EXCLUDED.clause_text,
+            last_seen_at  = NOW(),
+            updated_at    = CASE
+                WHEN (rb.category_code, rb.bian_domain, rb.rule_title, rb.clause_text)
+                     IS DISTINCT FROM
+                     (EXCLUDED.category_code, EXCLUDED.bian_domain, EXCLUDED.rule_title, EXCLUDED.clause_text)
+                THEN NOW() ELSE rb.updated_at END;
     """
+    t0 = time.monotonic()
     try:
         execute_batch(cur, upsert_sql, rules, page_size=50)
         conn.commit()
     except Exception:
         conn.rollback()
+        log.error("DB upsert failed; rolled back %d rule(s): %s",
+                  len(rules), [r["rule_id"] for r in rules])
         raise
     finally:
         cur.close()
+    log.debug("db upsert ok", extra={"rows": len(rules), "db_s": round(time.monotonic() - t0, 3)})
     for r in rules:
-        print(f"      📄 [{r['bian_domain']}] {r['rule_id']} -> {r['rule_title']}")
+        log.info("   📄 [%s] %s -> %s", r["bian_domain"], r["rule_id"], r["rule_title"],
+                 extra={"rule_id": r["rule_id"]})
+
+
+# ---------------------------------------------------------------------------
+# 5. Reconciliation: delete rules a complete run of a document no longer produces
+# ---------------------------------------------------------------------------
+def db_now(conn):
+    """Database clock at run start; rows seen by this run get last_seen_at >= this."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT now()")
+        ts = cur.fetchone()[0]
+    conn.commit()  # end the transaction so later NOW() calls are newer
+    return ts
+
+
+def prune_scope(conn, scope: dict, seen_since) -> int:
+    """Delete rows of one (vendor, tier, source_doc) that were not seen since `seen_since`."""
+    where = "vendor_id = %(vendor)s AND card_tier = %(tier)s AND source_doc = %(source_doc)s"
+    params = {**scope, "since": seen_since}
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM core.bank_rulebook WHERE {where} AND last_seen_at >= %(since)s", params)
+        seen = cur.fetchone()[0]
+        if seen == 0:
+            # A complete run that produced nothing is suspicious (wrong file, empty PDF, model
+            # issue). Refuse to wipe the document's existing rules on that basis.
+            conn.rollback()
+            log.warning("🛑 prune skipped for %s: this run saved 0 rules for it", scope["source_doc"],
+                        extra={"event": "prune_skipped", "scope": scope})
+            return 0
+        cur.execute(f"""DELETE FROM core.bank_rulebook
+                        WHERE {where} AND (last_seen_at IS NULL OR last_seen_at < %(since)s)
+                        RETURNING rule_id, rule_title""", params)
+        deleted = cur.fetchall()
+    conn.commit()
+    for rule_id, title in deleted:
+        log.info("   🗑️ pruned %s -> %s", rule_id, title, extra={"rule_id": rule_id})
+    log.info("🧹 %s: kept %d rule(s), pruned %d stale rule(s) no longer in the document",
+             scope["source_doc"], seen, len(deleted),
+             extra={"event": "prune", "scope": scope, "kept": seen, "pruned": len(deleted)})
+    return len(deleted)
+
+
+def reconcile(conn, complete: list, pending: list, seen_since, no_prune: bool) -> None:
+    """Prune complete scopes now; record pending ones so --retry-failed can prune them later."""
+    for scope in complete:
+        if no_prune:
+            log.info("⏭️ --no-prune: stale rules for %s left in place", scope["source_doc"])
+        else:
+            prune_scope(conn, scope, seen_since)
+    if pending:
+        log.warning("⏸️ prune deferred for %s until --retry-failed clears their failed chunks",
+                    [s["source_doc"] for s in pending])
+    # Always written, so a retry run knows which scopes still await pruning and since when.
+    log.info("prune context", extra={"event": "prune_context", "seen_since": seen_since.isoformat(),
+                                     "pending": pending})
+
+
+def load_prune_context(prev_run_dir: Path):
+    from datetime import datetime as _dt
+    for line in (prev_run_dir / "run.jsonl").open(encoding="utf-8"):
+        rec = json.loads(line)
+        if rec.get("event") == "prune_context":
+            return _dt.fromisoformat(rec["seen_since"]), rec.get("pending") or []
+    return None, []
 
 
 def preflight(client: ollama.Client) -> None:
     """Fail fast if Ollama is unreachable or the model is missing, and warn on CPU-only inference."""
     try:
         names = {m["model"] for m in client.list()["models"]}
-    except Exception as e:
-        sys.exit(f"❌ Cannot reach Ollama at {OLLAMA_HOST}: {e}")
+    except Exception:
+        log.critical("❌ Cannot reach Ollama at %s", OLLAMA_HOST, exc_info=True)
+        sys.exit(1)
     wanted = EXTRACTION_MODEL if ":" in EXTRACTION_MODEL else f"{EXTRACTION_MODEL}:latest"
     if wanted not in names:
-        sys.exit(
-            f"❌ Model '{EXTRACTION_MODEL}' not found on {OLLAMA_HOST}. "
-            f"Available: {sorted(names)}. Run `ollama pull {EXTRACTION_MODEL}` or set EXTRACTION_MODEL."
+        log.critical(
+            "❌ Model '%s' not found on %s. Available: %s. Run `ollama pull %s` or set EXTRACTION_MODEL.",
+            EXTRACTION_MODEL, OLLAMA_HOST, sorted(names), EXTRACTION_MODEL,
         )
-    print(f"🔌 Ollama {OLLAMA_HOST} | model {EXTRACTION_MODEL} | warming up...", flush=True)
+        sys.exit(1)
+    log.info("🔌 Ollama %s | model %s | warming up...", OLLAMA_HOST, EXTRACTION_MODEL)
     t0 = time.monotonic()
-    client.generate(model=EXTRACTION_MODEL, prompt="", keep_alive="15m")
-    loaded = [m for m in client.ps()["models"] if m["model"] == wanted]
-    gpu = loaded and loaded[0].get("size_vram", 0) > 0
-    print(f"   model ready in {time.monotonic() - t0:.1f}s ({'GPU' if gpu else 'CPU only'})", flush=True)
-    if not gpu:
-        print("   ⚠️ Model is running on CPU; extraction will be slow. "
-              "If this is the Docker container, point OLLAMA_HOST at the native Ollama.app.", flush=True)
+    # Warm up with the SAME num_ctx the extraction calls use. Ollama keys a loaded model on its
+    # context size: warming up with the Modelfile default (e.g. 16384 in Modelfile.pro) and then
+    # chatting at LLM_NUM_CTX forced a full reload, and /api/ps checked during that reload
+    # reported 0 bytes of VRAM -> a false "CPU only" warning.
+    client.generate(model=EXTRACTION_MODEL, prompt="", keep_alive="15m", options={"num_ctx": LLM_NUM_CTX})
+
+    entry = None
+    for _ in range(10):  # the scheduler can briefly report nothing while it settles
+        entry = next((m for m in client.ps()["models"] if m["model"] == wanted), None)
+        if entry and entry.get("size"):
+            break
+        time.sleep(0.5)
+    warmup_s = round(time.monotonic() - t0, 2)
+    if not entry or not entry.get("size"):
+        log.warning("⚠️ could not confirm where %s is loaded (not listed by %s/api/ps)", wanted, OLLAMA_HOST)
+        return
+    gpu_pct = round(100 * (entry.get("size_vram") or 0) / entry["size"])
+    placement = "GPU" if gpu_pct >= 99 else ("CPU only" if gpu_pct == 0 else f"{gpu_pct}% GPU / {100 - gpu_pct}% CPU")
+    log.info("   model ready in %.1fs (%s)", warmup_s, placement,
+             extra={"gpu": gpu_pct > 0, "gpu_pct": gpu_pct, "warmup_s": warmup_s, "num_ctx": LLM_NUM_CTX})
+    if gpu_pct < 99:
+        if "127.0.0.1" in OLLAMA_HOST:
+            hint = ("This is the native Ollama.app. Check `ollama ps`: other loaded models or another "
+                    "ingestion run can squeeze GPU memory; lowering LLM_NUM_CTX also reduces it.")
+        else:
+            hint = ("OLLAMA_HOST may be the Docker container, which has no Metal GPU on macOS. "
+                    "Use OLLAMA_HOST=http://127.0.0.1:11434 (native Ollama.app).")
+        log.warning("⚠️ Model is only %d%% on GPU; extraction will be slower. %s", gpu_pct, hint)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Dynamic Credit Card Disclosure & Bulletin Rule Extractor")
     parser.add_argument("--source", type=str, default=None, help="Path to PDF/TXT/MD file or URL to ingest")
     parser.add_argument("--dir", type=str, default=None, help="Directory of PDF/TXT disclosure files to batch ingest")
-    parser.add_argument("--tier", type=str, default="standard_credit", help="Card tier (e.g., standard_credit, reserve_infinite)")
-    parser.add_argument("--vendor", type=str, default="CHASE", help="Issuing vendor ID (e.g., CHASE, AMEX, ANZ)")
+    parser.add_argument("--retry-failed", type=str, default=None, metavar="RUN_DIR",
+                        help="Re-process only the failed chunks of a previous run (e.g. logs/17-Nov-2026_20-47-48_8d95de). "
+                             "Vendor/tier default to that run's values.")
+    parser.add_argument("--tier", type=str, default=None, help="Card tier (default: standard_credit)")
+    parser.add_argument("--vendor", type=str, default=None, help="Issuing vendor ID (default: CHASE)")
+    parser.add_argument("--no-prune", action="store_true",
+                        help="Keep rules that this run no longer extracts (default: delete them per document "
+                             "once the document is fully processed without failures)")
+    parser.add_argument("--log-level", default=LOG_LEVEL.upper(),
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"], type=str.upper,
+                        help="Console verbosity (the run.jsonl file always records DEBUG)")
     args = parser.parse_args()
 
+    if args.retry_failed and (args.source or args.dir):
+        parser.error("--retry-failed cannot be combined with --source/--dir")
+    if not args.retry_failed:
+        args.tier = args.tier or "standard_credit"
+        args.vendor = args.vendor or "CHASE"
+
+    run_dir = setup_logging(args.log_level)
+    log.info("🚀 run %s started | log: %s", _CTX["run_id"], run_dir / "run.jsonl", extra={
+        "cli_args": vars(args), "model": EXTRACTION_MODEL, "ollama_host": OLLAMA_HOST,
+        "db": f"{env('POSTGRES_DB', 'bank_aidb')}@{env('DB_HOST', 'localhost')}:{env('DB_PORT', '5432')}",
+        "num_ctx": LLM_NUM_CTX, "num_predict": LLM_NUM_PREDICT, "timeout_s": LLM_TIMEOUT_S,
+        "max_rules_per_chunk": MAX_RULES_PER_CHUNK, "retry_attempts": RETRY_ATTEMPTS,
+    })
+    try:
+        exit_code = retry_failed(args, run_dir) if args.retry_failed else run(args, run_dir)
+    except SystemExit:
+        raise
+    except BaseException:
+        log.critical("💥 run aborted by an unhandled error", exc_info=True)
+        log.critical("   full traceback in %s", run_dir / "run.jsonl")
+        sys.exit(1)
+    sys.exit(exit_code)
+
+
+def run(args, run_dir: Path) -> int:
     client = ollama.Client(host=OLLAMA_HOST, timeout=LLM_TIMEOUT_S)
     preflight(client)
-    sources_to_process = []
 
     if args.source:
-        sources_to_process.append((args.source, read_source_content(args.source)))
+        candidates = [args.source]
     elif args.dir:
-        for file_path in sorted(Path(args.dir).glob("*")):
-            if file_path.suffix.lower() in {".pdf", ".txt", ".md"}:
-                sources_to_process.append((str(file_path), read_source_content(str(file_path))))
+        candidates = [str(p) for p in sorted(Path(args.dir).glob("*"))
+                      if p.suffix.lower() in {".pdf", ".txt", ".md"}]
+        log.info("📂 %d file(s) found in %s", len(candidates), args.dir)
     else:
-        print("ℹ️ No --source or --dir specified; extracting exhaustive rules from built-in Schumer Box & Bulletin corpus...")
+        log.info("ℹ️ No --source or --dir specified; extracting exhaustive rules from built-in Schumer Box & Bulletin corpus...")
+        candidates = []
+
+    sources_to_process, failed = [], []
+    for src in candidates:
+        _CTX["source"] = Path(src).name
+        t0 = time.monotonic()
+        try:
+            text = read_source_content(src)
+        except Exception as e:
+            log.error("❌ could not read source %s: %s", src, _short(e), exc_info=True)
+            failed.append({"source": src, "chunk": None, "stage": "read", "error": f"{type(e).__name__}: {e}"})
+            continue
+        finally:
+            _CTX.pop("source", None)
+        log.info("📖 read %s (%d chars) in %.1fs", src, len(text), time.monotonic() - t0,
+                 extra={"source": src, "chars": len(text)})
+        if not text.strip():
+            log.warning("⚠️ %s produced no text; skipping", src)
+            continue
+        sources_to_process.append((src, text))
+    if not candidates:
         sources_to_process.append(("built_in_schumer_corpus", SYNTHETIC_DISCLOSURE_CORPUS))
 
     conn = psycopg2.connect(DB_URI)
-    total_rules, failed, run_start = 0, [], time.monotonic()
+    log.debug("db connected", extra={"server_version": conn.server_version})
+    seen_since = db_now(conn)
+    total_rules, total_chunks, interrupted, run_start = 0, 0, False, time.monotonic()
+    complete, pending = [], []  # scopes (vendor, tier, source_doc) eligible for pruning
     try:
         for src_name, raw_text in sources_to_process:
+            _CTX["source"] = Path(src_name).name
+            scope = {"vendor": args.vendor, "tier": args.tier, "source_doc": Path(src_name).name}
+            failures_before = len(failed)
             chunks = chunk_document(raw_text)
-            print(f"🔍 Parsing '{src_name}' ({len(chunks)} chunks) via {EXTRACTION_MODEL}...", flush=True)
+            log.info("🔍 Parsing '%s' (%d chunks) via %s...", src_name, len(chunks), EXTRACTION_MODEL,
+                     extra={"chunks": len(chunks), "chunk_sizes": [len(c) for c in chunks]})
             for idx, chunk in enumerate(chunks, start=1):
-                print(f"   ⚙️ Chunk {idx}/{len(chunks)} ({len(chunk)} chars)...", end=" ", flush=True)
+                _CTX["chunk"] = f"{idx}/{len(chunks)}"
+                total_chunks += 1
+                log.info("⚙️ extracting (%d chars)...", len(chunk), extra={"chars": len(chunk)})
                 t0 = time.monotonic()
                 try:
-                    batch = extract_rules_from_chunk(client, chunk, args.tier, args.vendor)
+                    batch, failed_parts = extract_with_retries(client, chunk, args.tier, args.vendor)
                 except Exception as e:
-                    print(f"skipped after {time.monotonic() - t0:.1f}s: {type(e).__name__}: {e}", flush=True)
-                    failed.append((src_name, idx))
+                    artifact = save_failure_artifact(run_dir, src_name, idx, chunk, e, args.vendor, args.tier)
+                    log.error("❌ skipped after %.1fs: %s | details: %s",
+                              time.monotonic() - t0, _short(e), artifact,
+                              exc_info=True, extra={"artifact": str(artifact)})
+                    failed.append({"source": src_name, "chunk": idx, "stage": "extract",
+                                   "error": f"{type(e).__name__}: {e}", "artifact": str(artifact)})
                     continue
-                print(f"{len(batch)} rules in {time.monotonic() - t0:.1f}s", flush=True)
-                load_rules(conn, batch)  # Upserts immediately so progress is saved per chunk
+                log.info("✔️ %d rules in %.1fs", len(batch), time.monotonic() - t0,
+                         extra={"rules": len(batch), "chunk_s": round(time.monotonic() - t0, 2)})
+                _record_failed_parts(run_dir, failed, src_name, f"{idx:04d}", failed_parts,
+                                     args.vendor, args.tier)
+                try:
+                    load_rules(conn, batch, scope["source_doc"])  # saved per chunk
+                except psycopg2.Error as e:
+                    artifact = save_failure_artifact(run_dir, src_name, idx, chunk, e,
+                                                     args.vendor, args.tier, stage="db")
+                    log.error("❌ DB write failed: %s | details: %s", _short(e), artifact, exc_info=True,
+                              extra={"pgcode": e.pgcode, "artifact": str(artifact)})
+                    failed.append({"source": src_name, "chunk": idx, "stage": "db",
+                                   "error": f"{type(e).__name__}: {e}", "artifact": str(artifact)})
+                    if conn.closed:
+                        raise
+                    continue
                 total_rules += len(batch)
+            _CTX.pop("chunk", None)
+            (pending if len(failed) > failures_before else complete).append(scope)
     except KeyboardInterrupt:
-        print("\n⏹️ Interrupted; rules from completed chunks are already saved.")
+        interrupted = True
+        log.warning("⏹️ Interrupted; rules from completed chunks are already saved.")
+    finally:
+        _CTX.pop("source", None)
+        _CTX.pop("chunk", None)
+    try:
+        if interrupted:
+            # Fully processed documents can still be pruned later by --retry-failed.
+            reconcile(conn, [], complete + pending, seen_since, args.no_prune)
+        else:
+            reconcile(conn, complete, pending, seen_since, args.no_prune)
     finally:
         conn.close()
 
-    print(f"✅ Upserted {total_rules} rules into core.bank_rulebook in {time.monotonic() - run_start:.0f}s.")
+    return _summarize(run_dir, total_rules, total_chunks, failed, interrupted, time.monotonic() - run_start)
+
+
+def _summarize(run_dir: Path, total_rules: int, total_chunks: int, failed: list,
+               interrupted: bool, elapsed: float, retry_of: str = None) -> int:
+    log.info("✅ Upserted %d rules into core.bank_rulebook from %d chunk(s) in %.0fs.",
+             total_rules, total_chunks, elapsed, extra={
+                 "event": "run_summary", "rules": total_rules, "chunks": total_chunks,
+                 "failed_count": len(failed), "failed": failed, "elapsed_s": round(elapsed, 1),
+                 "interrupted": interrupted, "retry_of": retry_of,
+             })
     if failed:
-        print(f"⚠️ {len(failed)} chunk(s) failed: {failed}")
+        log.warning("⚠️ %d failure(s):", len(failed))
+        for f in failed:
+            log.warning("   %s chunk %s [%s] %s", Path(f["source"]).name, f["chunk"], f["stage"],
+                        f["error"].splitlines()[0][:200])
+        log.warning("   failure details: %s", run_dir / "failed")
+        log.warning("   re-process them with: python ingestion/parse_disclosure.py --retry-failed %s", run_dir)
+    return 130 if interrupted else (2 if failed else 0)
+
+
+def retry_failed(args, run_dir: Path) -> int:
+    """Re-run extraction for the failed chunks of a previous run (idempotent upserts)."""
+    prev = Path(args.retry_failed).expanduser()
+    if not (prev / "run.jsonl").exists():
+        log.critical("❌ %s is not a run directory (no run.jsonl)", prev)
+        return 1
+    if not (prev / "failed").is_dir():
+        log.info("✅ run %s had no failed chunks; nothing to retry", prev.name)
+        return 0
+    items = load_failed_chunks(prev)
+    log.info("🔁 retrying %d failed chunk(s) from run %s", len(items), prev.name,
+             extra={"retry_of": prev.name, "count": len(items)})
+    if not items:
+        return 0
+
+    seen_since, pending = load_prune_context(prev)
+    client = ollama.Client(host=OLLAMA_HOST, timeout=LLM_TIMEOUT_S)
+    preflight(client)
+    conn = psycopg2.connect(DB_URI)
+    total_rules, failed, interrupted, run_start = 0, [], False, time.monotonic()
+    try:
+        for n, it in enumerate(items, start=1):
+            vendor, tier = args.vendor or it["vendor"], args.tier or it["tier"]
+            if not vendor or not tier:
+                log.error("❌ %s has no vendor/tier recorded; pass --vendor and --tier", it["artifact"])
+                failed.append({"source": it["source"], "chunk": it["chunk"], "stage": "retry",
+                               "error": "missing vendor/tier", "artifact": it["artifact"]})
+                continue
+            _CTX["source"] = Path(it["source"]).name
+            _CTX["chunk"] = f"{it['chunk']} (retry {n}/{len(items)})"
+            t0 = time.monotonic()
+            try:
+                batch, failed_parts = extract_with_retries(client, it["chunk_text"], tier, vendor)
+                load_rules(conn, batch, Path(it["source"]).name)
+            except Exception as e:
+                stage = "db" if isinstance(e, psycopg2.Error) else "extract"
+                artifact = save_failure_artifact(run_dir, it["source"], it["chunk"], it["chunk_text"],
+                                                 e, vendor, tier, stage=stage)
+                log.error("❌ still failing after %.1fs: %s | details: %s", time.monotonic() - t0,
+                          _short(e), artifact, exc_info=True, extra={"artifact": str(artifact)})
+                failed.append({"source": it["source"], "chunk": it["chunk"], "stage": stage,
+                               "error": f"{type(e).__name__}: {e}", "artifact": str(artifact)})
+                if conn.closed:
+                    raise
+                continue
+            log.info("✔️ recovered %d rules in %.1fs", len(batch), time.monotonic() - t0,
+                     extra={"rules": len(batch), "recovered_from": it["artifact"]})
+            chunk_label = f"{it['chunk']:04d}" if isinstance(it["chunk"], int) else it["chunk"]
+            _record_failed_parts(run_dir, failed, it["source"], chunk_label, failed_parts, vendor, tier)
+            total_rules += len(batch)
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning("⏹️ Interrupted; rules from completed chunks are already saved.")
+    finally:
+        _CTX.pop("source", None)
+        _CTX.pop("chunk", None)
+    try:
+        if seen_since is None:
+            log.info("ℹ️ run %s predates pruning support; no stale-rule cleanup to finish", prev.name)
+        else:
+            still_failing = {Path(f["source"]).name for f in failed}
+            done = [] if interrupted else [s for s in pending if s["source_doc"] not in still_failing]
+            reconcile(conn, done, [s for s in pending if s not in done], seen_since, args.no_prune)
+    finally:
+        conn.close()
+    return _summarize(run_dir, total_rules, len(items), failed, interrupted,
+                      time.monotonic() - run_start, retry_of=prev.name)
 
 
 if __name__ == "__main__":
