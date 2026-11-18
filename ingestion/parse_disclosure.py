@@ -2,6 +2,7 @@ import os
 import re
 import json
 import hashlib
+import io
 import argparse
 import logging
 import sys
@@ -55,6 +56,14 @@ LLM_NUM_CTX = int(env("LLM_NUM_CTX", "8192"))        # prompt + schema + output 
 LLM_NUM_PREDICT = int(env("LLM_NUM_PREDICT", "2048")) # stops runaway JSON generation
 LOG_DIR = Path(env("LOG_DIR", str(Path(__file__).resolve().parent.parent / "logs")))
 LOG_LEVEL = env("LOG_LEVEL", "INFO")
+
+# Input guards (see read_source_content / check_relevance / prune_scope)
+MAX_SOURCE_MB = float(env("MAX_SOURCE_MB", "25"))            # per file or download
+MAX_PDF_PAGES = int(env("MAX_PDF_PAGES", "200"))
+DOWNLOAD_DEADLINE_S = float(env("DOWNLOAD_DEADLINE_S", "120"))  # whole download, not per read
+MIN_RELEVANCE_TERMS = int(env("MIN_RELEVANCE_TERMS", "4"))    # distinct card-disclosure terms required
+PRUNE_MAX_DROP_RATIO = float(env("PRUNE_MAX_DROP_RATIO", "0.5"))  # refuse to prune more than this share
+PRUNE_MIN_PRIOR_ROWS = int(env("PRUNE_MIN_PRIOR_ROWS", "5"))  # ratio check only applies at/above this size
 
 # ---------------------------------------------------------------------------
 # 0. Execution Logging
@@ -265,8 +274,12 @@ def _is_grounded(clause_text: str, source_text: str) -> bool:
 # ---------------------------------------------------------------------------
 # 1. Multi-Channel Document Readers & Structure-Aware Chunker
 # ---------------------------------------------------------------------------
-def read_pdf_text(pdf_path: Path) -> str:
-    reader = PdfReader(str(pdf_path))
+def read_pdf_text(pdf: "Path | io.BytesIO") -> str:
+    """Accepts a local path or an in-memory stream (PDFs downloaded from a URL)."""
+    reader = PdfReader(pdf if isinstance(pdf, io.BytesIO) else str(pdf))
+    if len(reader.pages) > MAX_PDF_PAGES:
+        raise InputRejected(f"PDF has {len(reader.pages)} pages, over MAX_PDF_PAGES={MAX_PDF_PAGES}; "
+                            "key-facts documents are short, so this is probably the wrong file")
     pages, empty = [], []
     for idx, page in enumerate(reader.pages, start=1):
         txt = page.extract_text() or ""
@@ -281,17 +294,89 @@ def read_pdf_text(pdf_path: Path) -> str:
     return "\n\n".join(pages)
 
 
+SUPPORTED_SUFFIXES = {".pdf", ".txt", ".md"}
+
+
+class InputRejected(ValueError):
+    """The source was readable but is not something we should ingest (too big, off-topic...)."""
+
+
+def _download(url: str) -> "tuple[bytes, str]":
+    """GET with a byte cap and a whole-download deadline (requests' timeout is per socket read)."""
+    max_bytes = int(MAX_SOURCE_MB * 1024 * 1024)
+    deadline = time.monotonic() + DOWNLOAD_DEADLINE_S
+    with requests.get(url, timeout=30, stream=True) as resp:
+        ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        declared = int(resp.headers.get("Content-Length") or 0)
+        log.debug("http fetch", extra={"status": resp.status_code, "content_type": ctype,
+                                       "content_length": declared})
+        resp.raise_for_status()
+        if declared > max_bytes:
+            raise InputRejected(f"URL declares {declared / 1e6:.1f} MB, over MAX_SOURCE_MB={MAX_SOURCE_MB}")
+        buf = bytearray()
+        for block in resp.iter_content(chunk_size=64 * 1024):
+            buf.extend(block)
+            if len(buf) > max_bytes:
+                raise InputRejected(f"download exceeded MAX_SOURCE_MB={MAX_SOURCE_MB}; aborted")
+            if time.monotonic() > deadline:
+                raise InputRejected(f"download took longer than DOWNLOAD_DEADLINE_S={DOWNLOAD_DEADLINE_S:.0f}s; aborted")
+    return bytes(buf), ctype
+
+
 def read_source_content(source_path_or_url: str) -> str:
     if source_path_or_url.startswith(("http://", "https://")):
-        resp = requests.get(source_path_or_url, timeout=15)
-        log.debug("http fetch", extra={"status": resp.status_code, "bytes": len(resp.content)})
-        resp.raise_for_status()
-        return resp.text
+        content, ctype = _download(source_path_or_url)
+        # Trust the magic bytes over the header: some servers send PDFs as octet-stream.
+        if content[:5] == b"%PDF-" or ctype == "application/pdf":
+            return read_pdf_text(io.BytesIO(content))
+        if ctype in ("text/plain", "text/markdown"):
+            return content.decode("utf-8", errors="ignore")
+        raise ValueError(
+            f"URL returned {ctype or 'unknown content type'}, not a PDF; "
+            "key-facts documents must be PDF links (download the PDF and use --source/--dir if needed)")
 
-    p = Path(source_path_or_url)
-    if p.suffix.lower() == ".pdf":
+    p = Path(source_path_or_url).expanduser()
+    suffix = p.suffix.lower()
+    if suffix not in SUPPORTED_SUFFIXES:
+        raise ValueError(f"unsupported file type {suffix or '(none)'}; expected one of "
+                         f"{', '.join(sorted(SUPPORTED_SUFFIXES))}")
+    if not p.is_file():
+        raise FileNotFoundError(f"no such file: {p.resolve()}")
+    size_mb = p.stat().st_size / (1024 * 1024)
+    if size_mb > MAX_SOURCE_MB:
+        raise InputRejected(f"file is {size_mb:.1f} MB, over MAX_SOURCE_MB={MAX_SOURCE_MB}")
+    if suffix == ".pdf":
         return read_pdf_text(p)
     return p.read_text(encoding="utf-8", errors="ignore")
+
+
+# Distinct signals of a credit card disclosure / key-facts statement. Generic finance words
+# (interest, fee, payment) are deliberately absent: mortgages and loan agreements have them too.
+_RELEVANCE_TERMS = {
+    "apr": r"\bAPRs?\b|annual\s+percentage\s+rates?",
+    "finance_charge": r"finance\s+charges?",  # non-US agreements (e.g. India) rarely say "APR"
+    "annual_fee": r"annual\s+(?:membership\s+)?fee",
+    "grace_period": r"grace\s+period",
+    "billing_cycle": r"billing\s+(?:cycle|period)|statement\s+(?:balance|closing)",
+    "minimum_payment": r"minimum\s+(?:payment|amount\s+due)",
+    "balance_transfer": r"balance\s+transfers?",
+    "cash_advance": r"cash\s+advances?",
+    "foreign_transaction": r"foreign\s+(?:transaction|currency)",
+    "late_fee": r"late\s+(?:payment\s+)?fee",
+    "penalty_apr": r"penalty\s+(?:APR|rate)",
+    "credit_limit": r"credit\s+(?:limit|line)",
+    "billing_rights": r"billing\s+(?:error|rights)|dispute",
+    "purchases": r"\bpurchases?\b",
+}
+_CARD_ANCHOR = r"credit\s+card|card\s*(?:holder|member)|card\s+account"
+
+
+def check_relevance(text: str) -> dict:
+    """Cheap pre-LLM gate: does this text look like a credit card disclosure at all?"""
+    hits = sorted(k for k, pat in _RELEVANCE_TERMS.items() if re.search(pat, text, re.I))
+    anchored = bool(re.search(_CARD_ANCHOR, text, re.I))
+    return {"ok": anchored and len(hits) >= MIN_RELEVANCE_TERMS,
+            "terms": hits, "anchored": anchored, "required": MIN_RELEVANCE_TERMS}
 
 
 def _split_oversized(block: str, max_chars: int) -> List[str]:
@@ -614,19 +699,37 @@ def db_now(conn):
     return ts
 
 
-def prune_scope(conn, scope: dict, seen_since) -> int:
+def _prune_verdict(seen: int, stale: int, prior: int, force: bool) -> "str | None":
+    """Return why pruning should be refused, or None if it is safe."""
+    if seen == 0:
+        # A complete run that produced nothing is suspicious (wrong file, empty PDF, model issue).
+        return "this run saved 0 rules for it"
+    if force:
+        return None
+    if prior >= PRUNE_MIN_PRIOR_ROWS and stale / prior > PRUNE_MAX_DROP_RATIO:
+        # Same file name, mostly different rules: a replaced/wrong file looks exactly like this.
+        return (f"it would delete {stale}/{prior} ({stale / prior:.0%}) of the existing rules, over "
+                f"PRUNE_MAX_DROP_RATIO={PRUNE_MAX_DROP_RATIO:.0%}; if the document really changed "
+                "that much, re-run with --force-prune")
+    return None
+
+
+def prune_scope(conn, scope: dict, seen_since, force: bool = False) -> int:
     """Delete rows of one (vendor, tier, source_doc) that were not seen since `seen_since`."""
     where = "vendor_id = %(vendor)s AND card_tier = %(tier)s AND source_doc = %(source_doc)s"
     params = {**scope, "since": seen_since}
     with conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM core.bank_rulebook WHERE {where} AND last_seen_at >= %(since)s", params)
-        seen = cur.fetchone()[0]
-        if seen == 0:
-            # A complete run that produced nothing is suspicious (wrong file, empty PDF, model
-            # issue). Refuse to wipe the document's existing rules on that basis.
+        cur.execute(f"""SELECT count(*) FILTER (WHERE last_seen_at >= %(since)s),
+                               count(*) FILTER (WHERE last_seen_at IS NULL OR last_seen_at < %(since)s),
+                               count(*) FILTER (WHERE created_at < %(since)s)
+                        FROM core.bank_rulebook WHERE {where}""", params)
+        seen, stale, prior = cur.fetchone()
+        refusal = _prune_verdict(seen, stale, prior, force)
+        if refusal:
             conn.rollback()
-            log.warning("🛑 prune skipped for %s: this run saved 0 rules for it", scope["source_doc"],
-                        extra={"event": "prune_skipped", "scope": scope})
+            log.warning("🛑 prune skipped for %s: %s", scope["source_doc"], refusal,
+                        extra={"event": "prune_skipped", "scope": scope,
+                               "seen": seen, "stale": stale, "prior": prior})
             return 0
         cur.execute(f"""DELETE FROM core.bank_rulebook
                         WHERE {where} AND (last_seen_at IS NULL OR last_seen_at < %(since)s)
@@ -641,13 +744,14 @@ def prune_scope(conn, scope: dict, seen_since) -> int:
     return len(deleted)
 
 
-def reconcile(conn, complete: list, pending: list, seen_since, no_prune: bool) -> None:
+def reconcile(conn, complete: list, pending: list, seen_since, no_prune: bool,
+              force_prune: bool = False) -> None:
     """Prune complete scopes now; record pending ones so --retry-failed can prune them later."""
     for scope in complete:
         if no_prune:
             log.info("⏭️ --no-prune: stale rules for %s left in place", scope["source_doc"])
         else:
-            prune_scope(conn, scope, seen_since)
+            prune_scope(conn, scope, seen_since, force=force_prune)
     if pending:
         log.warning("⏸️ prune deferred for %s until --retry-failed clears their failed chunks",
                     [s["source_doc"] for s in pending])
@@ -723,6 +827,11 @@ def main():
     parser.add_argument("--no-prune", action="store_true",
                         help="Keep rules that this run no longer extracts (default: delete them per document "
                              "once the document is fully processed without failures)")
+    parser.add_argument("--force-prune", action="store_true",
+                        help=f"Prune even if it would delete more than {PRUNE_MAX_DROP_RATIO * 100:.0f}%% of a document's "
+                             "existing rules (use when a document was substantially rewritten)")
+    parser.add_argument("--skip-relevance-check", action="store_true",
+                        help="Ingest sources even if they do not look like credit card disclosures")
     parser.add_argument("--log-level", default=LOG_LEVEL.upper(),
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"], type=str.upper,
                         help="Console verbosity (the run.jsonl file always records DEBUG)")
@@ -730,6 +839,8 @@ def main():
 
     if args.retry_failed and (args.source or args.dir):
         parser.error("--retry-failed cannot be combined with --source/--dir")
+    if args.no_prune and args.force_prune:
+        parser.error("--no-prune and --force-prune are contradictory")
     if not args.retry_failed:
         args.tier = args.tier or "standard_credit"
         args.vendor = args.vendor or "CHASE"
@@ -760,7 +871,7 @@ def run(args, run_dir: Path) -> int:
         candidates = [args.source]
     elif args.dir:
         candidates = [str(p) for p in sorted(Path(args.dir).glob("*"))
-                      if p.suffix.lower() in {".pdf", ".txt", ".md"}]
+                      if p.suffix.lower() in SUPPORTED_SUFFIXES]
         log.info("📂 %d file(s) found in %s", len(candidates), args.dir)
     else:
         log.info("ℹ️ No --source or --dir specified; extracting exhaustive rules from built-in Schumer Box & Bulletin corpus...")
@@ -772,6 +883,10 @@ def run(args, run_dir: Path) -> int:
         t0 = time.monotonic()
         try:
             text = read_source_content(src)
+        except InputRejected as e:  # a policy decision, not a crash: no traceback
+            log.error("❌ rejected %s: %s", src, e)
+            failed.append({"source": src, "chunk": None, "stage": "limits", "error": str(e)})
+            continue
         except Exception as e:
             log.error("❌ could not read source %s: %s", src, _short(e), exc_info=True)
             failed.append({"source": src, "chunk": None, "stage": "read", "error": f"{type(e).__name__}: {e}"})
@@ -783,6 +898,18 @@ def run(args, run_dir: Path) -> int:
         if not text.strip():
             log.warning("⚠️ %s produced no text; skipping", src)
             continue
+        rel = check_relevance(text)
+        log.debug("relevance check", extra={"source": src, **rel})
+        if not rel["ok"]:
+            reason = (f"does not look like a credit card disclosure: {len(rel['terms'])}/{rel['required']} "
+                      f"card terms found {rel['terms']}"
+                      + ("" if rel["anchored"] else ", no mention of credit card/cardholder"))
+            if args.skip_relevance_check:
+                log.warning("⚠️ %s %s; ingesting anyway (--skip-relevance-check)", src, reason)
+            else:
+                log.error("❌ rejected %s: %s (override with --skip-relevance-check)", src, reason)
+                failed.append({"source": src, "chunk": None, "stage": "relevance", "error": reason})
+                continue
         sources_to_process.append((src, text))
     if not candidates:
         sources_to_process.append(("built_in_schumer_corpus", SYNTHETIC_DISCLOSURE_CORPUS))
@@ -845,7 +972,7 @@ def run(args, run_dir: Path) -> int:
             # Fully processed documents can still be pruned later by --retry-failed.
             reconcile(conn, [], complete + pending, seen_since, args.no_prune)
         else:
-            reconcile(conn, complete, pending, seen_since, args.no_prune)
+            reconcile(conn, complete, pending, seen_since, args.no_prune, args.force_prune)
     finally:
         conn.close()
 
@@ -932,7 +1059,8 @@ def retry_failed(args, run_dir: Path) -> int:
         else:
             still_failing = {Path(f["source"]).name for f in failed}
             done = [] if interrupted else [s for s in pending if s["source_doc"] not in still_failing]
-            reconcile(conn, done, [s for s in pending if s not in done], seen_since, args.no_prune)
+            reconcile(conn, done, [s for s in pending if s not in done], seen_since, args.no_prune,
+                      args.force_prune)
     finally:
         conn.close()
     return _summarize(run_dir, total_rules, len(items), failed, interrupted,

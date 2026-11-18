@@ -5673,3 +5673,36 @@ venv/lib/python3.12/site-packages/uvicorn-0.28.0.dist-info/licenses/LICENSE.md
 ingestion/__pycache__/parse_disclosure.cpython-312.pyc
 
 logs/
+tests/__pycache__/test_ingestion_guards.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/__pycache__/__init__.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/__pycache__/_lazyimport.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/__pycache__/lowlevel.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/__pycache__/pytest_plugin.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/__pycache__/to_thread.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_backends/__pycache__/__init__.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_backends/__pycache__/_asyncio.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_backends/__pycache__/_trio.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/__init__.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_eventloop.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_exceptions.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_resources.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_sockets.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_streams.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_synchronization.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_tasks.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_testing.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/_core/__pycache__/_typedattr.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/__init__.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_eventloop.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_resources.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_sockets.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_streams.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_subprocesses.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_tasks.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/abc/__pycache__/_testing.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/streams/__pycache__/__init__.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/streams/__pycache__/memory.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/streams/__pycache__/stapled.cpython-312-pytest-8.0.2.pyc
+venv/lib/python3.12/site-packages/anyio/streams/__pycache__/tls.cpython-312-pytest-8.0.2.pyc
+docs/Rulebook Ingestion Pipeline.pdf
+docs/ingestion-pipeline-summary.pdf

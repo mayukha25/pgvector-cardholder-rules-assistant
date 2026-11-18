@@ -9,13 +9,14 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 ## Contents
 
 1. [How it works](#how-it-works)
-2. [Project layout](#project-layout)
-3. [Prerequisites](#prerequisites)
-4. [Step-by-step setup and execution](#step-by-step-setup-and-execution)
-5. [Day-to-day operations](#day-to-day-operations)
-6. [Configuration reference](#configuration-reference)
-7. [Troubleshooting](#troubleshooting)
-8. [Stopping and resetting](#stopping-and-resetting)
+2. [Ingestion pipeline](#ingestion-pipeline)
+3. [Project layout](#project-layout)
+4. [Prerequisites](#prerequisites)
+5. [Step-by-step setup and execution](#step-by-step-setup-and-execution)
+6. [Day-to-day operations](#day-to-day-operations)
+7. [Configuration reference](#configuration-reference)
+8. [Troubleshooting](#troubleshooting)
+9. [Stopping and resetting](#stopping-and-resetting)
 
 ---
 
@@ -60,6 +61,83 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 
 ---
 
+## Ingestion pipeline
+
+`ingestion/parse_disclosure.py` turns credit card disclosure documents into structured rules in `core.bank_rulebook`, using a local LLM through Ollama. Bad input is stopped before any model call, failures are retried and isolated, and existing rules are never deleted on weak evidence. A one-page version of this section is in [docs/ingestion-pipeline-summary.pdf](docs/ingestion-pipeline-summary.pdf).
+
+```
+Input ─► Limits* ─► Text ─► Relevance* ─► Chunk ─► Extract* ─► Upsert ─► Prune*
+                                              * can reject input or hold back changes
+```
+
+### Inputs
+
+- `--source`: one local `.pdf`, `.txt` or `.md` file, or an `http(s)` URL.
+- `--dir`: every supported file at the top level of a folder.
+- Neither flag: a built-in sample corpus, for demos and smoke tests.
+- URLs: PDFs are recognised by their `%PDF-` signature, even when the server labels them as generic files. Plain text and Markdown are accepted; HTML pages (login walls, error pages) are rejected.
+- Every source is tagged with `--vendor` and `--tier` (defaults `CHASE` and `standard_credit`).
+
+### Checks before any LLM call
+
+A rejected source is listed in the run summary and the run exits with code 2.
+
+| Check | Rule | Failure stage |
+|---|---|---|
+| File size | Files and downloads over `MAX_SOURCE_MB` (25) are rejected; downloads are stopped while streaming | `limits` |
+| Page count | PDFs over `MAX_PDF_PAGES` (200) are rejected | `limits` |
+| Download time | `DOWNLOAD_DEADLINE_S` (120) for the whole download | `limits` |
+| File exists | A missing file gives a clear "no such file" error | `read` |
+| Readable text | Pages with no text (scanned images) are logged; a document with no text is skipped | warning |
+| Relevance | Must mention a credit card, cardholder or card account, plus at least `MIN_RELEVANCE_TERMS` (4) distinct card-disclosure terms: APR or finance charges, annual fee, grace period, billing cycle, minimum payment, balance transfer, cash advance, foreign transaction, late fee, penalty APR, credit limit, billing error/dispute, purchases. Override with `--skip-relevance-check` | `relevance` |
+
+### Extraction
+
+- Text is split on paragraph and section breaks into chunks of about 2,200 characters, overlapping by about 300.
+- Default model `llama3.2:3b` via Ollama, temperature 0, with output forced into a fixed JSON schema:
+  - `category_code`: one of 16 (APR, FEE, FX, PAYMENT, BILLING, DISPUTE, LIMIT, REWARD, FRAUD, GRACE, LIABILITY, SECURITY, CARDMGMT, LEGAL, PRIVACY, GENERAL)
+  - `bian_domain`: one of 9 BIAN Service Domains
+  - `rule_title` (up to 150 characters) and `clause_text` (up to 2,000)
+  - at most `MAX_RULES_PER_CHUNK` (10) rules per chunk
+- Output that is cut off or doesn't match the schema is retried. Rules whose numbers (fees, %, days) don't appear in the source chunk are dropped, and so are duplicates.
+- Before the run, the script checks Ollama is reachable and the model is installed, warms it up, and warns if it is running on CPU instead of GPU.
+
+### Failure recovery
+
+- Up to three attempts per chunk: **default**, then **resample** (different sampling settings to break repeating loops), then **split** (halve the chunk; rules from a half that works are kept).
+- One failed chunk or source never stops the run. Each failure is saved to `logs/<run>/failed/` with the chunk text, the model's raw output from every attempt and the error.
+- `--retry-failed <run_dir>` reprocesses only those chunks. Ctrl-C stops the run but keeps every rule already saved.
+
+### Loading and pruning
+
+- Rules are upserted per chunk as `rule_loader`, with stable IDs, and only new or changed rules are queued for embedding. See [Adding or changing rules](#adding-or-changing-rules) for how re-runs and pruning behave.
+- Pruning is scoped to one document. It is deferred if any chunk failed or the run was interrupted, refused if the run saved 0 rules for the document, and refused if it would delete more than `PRUNE_MAX_DROP_RATIO` (50%) of the document's existing rules (`--force-prune` overrides; `--no-prune` disables).
+
+### Logs and exit codes
+
+- Console shows short progress lines (`--log-level`). `logs/<run>/run.jsonl` records every event at DEBUG, tagged with run, source and chunk.
+- The run summary lists each failure by stage (`read`, `limits`, `relevance`, `extract`, `db`) and prints the `--retry-failed` command.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Aborted (Ollama unreachable, model missing, unhandled error) |
+| `2` | Some sources or chunks failed |
+| `130` | Interrupted |
+
+### Not covered yet
+
+These are judgment calls rather than hard rules, so they are planned for the Data Quality layer instead of blocking ingestion.
+
+| Gap | Plan |
+|---|---|
+| Issuer and tier aren't checked against the document (Amex rules could be saved under `--vendor CHASE`) | Data Quality report flagging documents where the issuer isn't mentioned |
+| Grounding only checks numbers; rules without numbers or reworded by the model pass | Data Quality score of each rule's word overlap with its source chunk |
+| Source chunk text isn't stored with each rule | Next: needed by the Data Quality checks |
+| No OCR for scanned PDFs; `--dir` skips subfolders | Not planned |
+
+---
+
 ## Project layout
 
 ```
@@ -73,6 +151,9 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 │   └── 03_embeddings_api.sql #   embedding column + HNSW index, job queue + trigger, api schema, grants
 ├── ingestion/
 │   └── parse_disclosure.py   # loads sample rules (runs on the host)
+├── docs/
+│   └── ingestion-pipeline-summary.pdf  # one-page summary of the ingestion pipeline
+├── tests/                    # pytest, no DB/Ollama/network needed: venv/bin/python -m pytest tests
 ├── workers/                  # embedding worker image
 │   ├── Dockerfile
 │   ├── embedding_worker.py
@@ -312,7 +393,10 @@ Re-running on the same document is safe:
 - **One row per clause.** `rule_id` is `{vendor}-{hash of vendor, tier and normalized clause text}`. The same clause always maps to the same row, even when the model picks a different title or category. Category is stored in its own `category_code` column.
 - **Stale rules are pruned per document.** Each run stamps `last_seen_at` on every rule it extracts. When a document finishes with no failed chunks, rules of that vendor, tier and `source_doc` that the run did not see are deleted. Other documents are never touched. Pass `--no-prune` to keep them.
 - **Failures defer the prune.** If any chunk of a document fails, nothing is pruned for it. The run prints a `--retry-failed <run_dir>` command. Once the retry clears the failures, the deferred prune runs. An interrupted run never prunes, and a run that saved 0 rules for a document refuses to prune it.
+- **Large drops are refused.** If a prune would delete more than half of a document's existing rules (`PRUNE_MAX_DROP_RATIO`), it is skipped with a warning. Under the same file name, that usually means the wrong file was ingested. If the document really was rewritten, re-run with `--force-prune`.
 - **Embeddings only redo what changed.** The trigger re-queues only rules that are new, whose title, domain or clause text changed, or that have no embedding yet. The worker re-embeds them and clears the query cache, so the next questions use the new rules immediately.
+
+Inputs are checked for size, page count, download time and relevance before any model call; see [Checks before any LLM call](#checks-before-any-llm-call).
 
 Every run writes `logs/<DD-Mon-YYYY_HH-MM-SS_id>/run.jsonl`. Each failed chunk gets a JSON file in that run's `failed/` folder with the chunk text and the model's raw output.
 
@@ -358,6 +442,10 @@ docker exec -it bank_postgres psql -U postgres -d bank_aidb   # SQL shell
 | `CONFIDENCE_THRESHOLD` | `docker-compose.yml` → `orchestrator` | `0.70` | Minimum cosine similarity needed to answer |
 | `EMBED_MODEL` / `MODEL_ID` | `orchestrator/app.py` / `workers/embedding_worker.py` | `nomic-embed-text` | Must match in both files, and must output 768 dimensions (or change `vector(768)` in `sql/03_embeddings_api.sql`) |
 | `CHAT_MODEL` | `orchestrator/app.py` | `llama3.2:3b` | Model that writes the answers |
+| `MAX_SOURCE_MB` / `MAX_PDF_PAGES` | `.env` | `25` / `200` | Largest file or download, and longest PDF, the ingestion script accepts |
+| `DOWNLOAD_DEADLINE_S` | `.env` | `120` | Time limit for a whole URL download |
+| `MIN_RELEVANCE_TERMS` | `.env` | `4` | Distinct card-disclosure terms a source needs to pass the relevance check |
+| `PRUNE_MAX_DROP_RATIO` / `PRUNE_MIN_PRIOR_ROWS` | `.env` | `0.5` / `5` | Largest share of a document's rules a prune may delete, and the minimum document size the check applies to |
 | Query cache TTL | `sql/03_embeddings_api.sql` | 24 hours | How long question embeddings are reused |
 
 ### Switching between GPU and CPU
