@@ -11,7 +11,8 @@ from psycopg2.extras import RealDictCursor
 from psycopg2.pool import ThreadedConnectionPool
 import ollama
 
-DB_URI = os.getenv("DB_URI", "dbname=bank_aidb user=mcp_assistant password=production_mcp_secret_token host=localhost port=5432")
+# Required, no default: credentials never live in code. docker-compose.yml builds it from .env.
+DB_URI = os.getenv("DB_URI")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.70"))
 # Connections are borrowed only for short DB steps, never across the LLM call, so a small
@@ -39,6 +40,8 @@ _pool_slots = threading.BoundedSemaphore(DB_POOL_MAX)
 @asynccontextmanager
 async def lifespan(_app):
     global _pool
+    if not DB_URI:
+        raise RuntimeError("DB_URI is not set; it is supplied by docker-compose.yml from .env")
     _pool = ThreadedConnectionPool(DB_POOL_MIN, DB_POOL_MAX, DB_URI)
     try:
         yield

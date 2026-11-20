@@ -7,7 +7,8 @@ import psycopg2.extensions
 from psycopg2.extras import RealDictCursor
 import ollama
 
-DB_URI = os.getenv("DB_URI", "dbname=bank_aidb user=postgres password=secret_admin_password host=localhost port=5432")
+# Required, no default: credentials never live in code. docker-compose.yml builds it from .env.
+DB_URI = os.getenv("DB_URI")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 MODEL_ID = os.getenv("MODEL_ID", "nomic-embed-text")
 
@@ -89,6 +90,8 @@ def sweep(cur, client) -> None:
 
 
 def run_worker():
+    if not DB_URI:
+        raise SystemExit("DB_URI is not set; it is supplied by docker-compose.yml from .env")
     print("🤖 [Worker Daemon] Connecting to PostgreSQL...")
     conn = psycopg2.connect(DB_URI)
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)

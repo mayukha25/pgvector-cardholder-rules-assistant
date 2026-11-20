@@ -14,9 +14,12 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 4. [Prerequisites](#prerequisites)
 5. [Step-by-step setup and execution](#step-by-step-setup-and-execution)
 6. [Day-to-day operations](#day-to-day-operations)
-7. [Configuration reference](#configuration-reference)
-8. [Troubleshooting](#troubleshooting)
-9. [Stopping and resetting](#stopping-and-resetting)
+7. [End-to-end verification](#end-to-end-verification)
+8. [Known issues](#known-issues)
+9. [Configuration reference](#configuration-reference)
+10. [Secrets and credentials](#secrets-and-credentials)
+11. [Troubleshooting](#troubleshooting)
+12. [Stopping and resetting](#stopping-and-resetting)
 
 ---
 
@@ -44,7 +47,7 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 
 1. **Ingest.** `parse_disclosure.py` upserts rules into `core.bank_rulebook`.
 2. **Queue and notify.** A trigger creates a row in `core.embedding_job` and sends `NOTIFY rulebook_events` with the `rule_id` and `job_id`.
-3. **Embed.** The worker receives the event, embeds `search_document: {title} [{domain}]: {clause}` with `nomic-embed-text`, stores the vector and its `embedding_scheme`, marks the rule's open jobs `COMPLETED`, and clears the query cache. At startup and every `EMBED_SWEEP_INTERVAL_S` (60 s) it also embeds any rule with no vector or a vector from an older scheme. That catches events missed while the worker was down, failed jobs, and re-embeds everything after a model or prefix change.
+3. **Embed.** The worker receives the event, embeds `search_document: {title} [{domain}]: {clause}` with `nomic-embed-text`, stores the vector and its `embedding_scheme`, and marks the rule's open jobs `COMPLETED`. It never clears the query cache: cached question vectors depend only on the question, not on the rules. At startup and every `EMBED_SWEEP_INTERVAL_S` (60 s) it also embeds any rule with no vector or a vector from an older scheme. That catches events missed while the worker was down, failed jobs, and re-embeds everything after a model or prefix change.
 4. **Answer.** The orchestrator embeds `search_query: {question}` (cached for 24 hours), finds the two closest rules for the customer's card tier and vendor, and then does one of two things:
    - If the best similarity is **≥ `CONFIDENCE_THRESHOLD`** (0.70), `llama3.2:3b` writes an answer using only those rules → `SUCCESS`.
    - Otherwise it returns a fixed "contact customer care" message → `ABSTAINED`.
@@ -56,8 +59,10 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 |---|---|---|
 | `postgres` | Admin / init scripts only | Everything |
 | `rule_loader` | `ingestion/parse_disclosure.py` | Insert, update and retire rules in `core.bank_rulebook` (no delete) |
-| `embed_worker` | `workers/embedding_worker.py` | Read rules; write only `embedding`/`updated_at`; update jobs |
-| `mcp_assistant` | `orchestrator/app.py` | Read rules **only through** `api.rulebook_vw`; use the query cache; append to the audit log. 2-second statement timeout |
+| `embed_worker` | `workers/embedding_worker.py` | Read rules; write only `embedding`/`embedding_scheme`/`updated_at`; update jobs. No access to the `api` schema |
+| `mcp_assistant` | `orchestrator/app.py` | Read active rules through `api.rulebook_vw`; use the query cache; append to and read the audit log (no update/delete). 2-second statement timeout, `hnsw.iterative_scan = strict_order` |
+
+The services get their credentials only from the `DB_URI` environment variable, which `docker-compose.yml` builds from `.env`. There are no fallback credentials in the code. See [Secrets and credentials](#secrets-and-credentials).
 
 ---
 
@@ -152,12 +157,14 @@ These are judgment calls rather than hard rules, so they are planned for the Dat
 │   ├── 04_rule_identity.sql  #   category_code, source_doc, last_seen_at (stable IDs + pruning)
 │   ├── 05_embedding_scheme.sql # embedding_scheme column, job attempts/last_error
 │   ├── 06_rule_lifecycle.sql #   retired_at/retired_reason, active-only view + vector index (vendor snapshots)
-│   └── 07_vector_search_settings.sql # hnsw.iterative_scan for the assistant (filtered HNSW keeps its top-k)
+│   ├── 07_vector_search_settings.sql # hnsw.iterative_scan for the assistant (filtered HNSW keeps its top-k)
+│   └── Test_client_api       #   ad-hoc audit-log queries; no .sql extension, so init skips it (keep it that way)
 ├── ingestion/
 │   └── parse_disclosure.py   # loads sample rules (runs on the host)
 ├── docs/
 │   └── ingestion-pipeline-summary.pdf  # one-page summary of the ingestion pipeline
 ├── tests/                    # pytest, no DB/Ollama/network needed: venv/bin/python -m pytest tests
+│   └── TestSequels.sql       #   ad-hoc inspection queries (rules per vendor/category), not run by pytest
 ├── workers/                  # embedding worker image
 │   ├── Dockerfile
 │   ├── embedding_worker.py
@@ -187,6 +194,8 @@ Also needed:
 > - The system `python3` is 3.9 and will **not** work, because several pinned packages have no 3.9 wheels.
 > - If you use conda, run `conda deactivate` first, so `(base)` doesn't shadow the virtual environment's `python`.
 > - In-place `sed` on macOS needs an empty suffix: `sed -i '' 's/a/b/' file`.
+> - zsh does not treat `#` as a comment in an interactive terminal by default, so a pasted command with a trailing `# comment` passes the comment words as arguments (for example `no such service: #`). Run `setopt interactivecomments` once (add it to `~/.zshrc` to keep it), or drop the comments when pasting.
+> - Shell variables such as `$S` exist only in the terminal that set them. In a new terminal they are empty, so `$S/v1` becomes `/v1`.
 
 ---
 
@@ -233,7 +242,7 @@ EOF
 )
 ```
 
-✅ **Check:** `cut -d= -f1 .env` lists the four keys, and `git check-ignore .env` prints `.env`.
+✅ **Check:** `cut -d= -f1 .env` lists the four keys, `git check-ignore .env` prints `.env`, and `git ls-files .env` prints nothing (the file is not tracked).
 
 > ⚠️ Create `.env` **before** the database starts for the first time. Postgres only runs the `sql/` init scripts on an empty volume. If it starts without these passwords, the roles are never created, and you must reset the volume (see [Stopping and resetting](#stopping-and-resetting)).
 
@@ -243,7 +252,15 @@ EOF
 docker compose up -d
 ```
 
-This starts only `postgres-ai` and `ollama`. The worker and orchestrator are in the `app` profile and start in Step 6. On the first run, Postgres runs `sql/01_roles.sh`, `02_schema.sql` and `03_embeddings_api.sql` in order.
+This starts only `postgres-ai` and `ollama`. The worker and orchestrator are in the `app` profile and start in Step 6. On the first run, Postgres runs `sql/01_roles.sh` through `07_vector_search_settings.sql` in order.
+
+✅ **Check that every init script ran:**
+
+```zsh
+docker logs bank_postgres 2>&1 | grep -E 'running /docker|ignoring|ERROR'
+```
+
+Each of `01`–`07` shows `running`, `Test_client_api` shows `ignoring`, and there are no `ERROR` lines.
 
 ✅ **Check that both containers are up and Postgres is healthy:**
 
@@ -280,6 +297,10 @@ docker exec bank_ollama ollama pull llama3.2:3b        # answer generation (~2 G
 docker compose --profile app up -d --build
 ```
 
+The worker and orchestrator are not run by hand: they are these two containers. `parse_disclosure.py` does not start them, and without them nothing is embedded and `/api/v1/chat` is unreachable. Keep `--build` whenever `workers/` or `orchestrator/` changed, or Docker reuses the old images.
+
+Start them **before** Step 7 so rules are embedded as they load. If you ingest first, nothing is lost: on startup the worker sweeps up every active rule that has no vector (or one from an older embedding scheme).
+
 ✅ **Check that the worker is listening for events:**
 
 ```zsh
@@ -308,27 +329,40 @@ docker logs -f bank_embedding_worker
 In your first terminal, with the virtual environment active, load the sample rules:
 
 ```zsh
-python ingestion/parse_disclosure.py
-# 📄 Loaded/Updated Rule: FEE-FX-001
-# 📄 Loaded/Updated Rule: FEE-LATE-005
+python ingestion/parse_disclosure.py; echo EXIT=$?
 ```
 
-Within a second or two, the worker terminal shows:
+Output looks like this (rule IDs are hashes of the clause text, so yours will differ):
 
 ```
-📥 [Event Received] Processing Rule: FEE-FX-001 (Job #1)
-✅ [Worker Action] Rule FEE-FX-001 embedded.
-📥 [Event Received] Processing Rule: FEE-LATE-005 (Job #2)
-✅ [Worker Action] Rule FEE-LATE-005 embedded.
+[built_in_schumer_corpus #1/2] ✔️ 10 rules in 6.0s
+[built_in_schumer_corpus #1/2]    📄 [Payment Execution] CHASE-27861EF6C640 -> Late Payment Fee
+...
+🧹 CHASE/standard_credit: 15 active rule(s), retired 0 no longer in the vendor's documents
+✅ Upserted 17 rules into core.bank_rulebook from 2 chunk(s) in 12s.
+EXIT=0
 ```
 
-✅ **Check:** every rule has an embedding and every job is complete.
+`Upserted` can be higher than the number of distinct rules: overlapping chunks can extract the same clause twice, and both writes go to the same row.
+
+Within a second or two, the worker terminal shows one pair of lines per upsert:
+
+```
+📥 [Event Received] Processing Rule: CHASE-27861EF6C640 (Job #2)
+✅ [Worker Action] Rule CHASE-27861EF6C640 embedded.
+```
+
+✅ **Check:** every active rule is embedded with the current scheme and every job is complete.
 
 ```zsh
 docker exec bank_postgres psql -U postgres -d bank_aidb \
-  -c "SELECT rule_id, embedding IS NOT NULL AS embedded FROM core.bank_rulebook;" \
-  -c "SELECT job_id, rule_id, status FROM core.embedding_job ORDER BY job_id;"
+  -c "SELECT vendor_id, card_tier, count(*) active, count(embedding) embedded,
+             count(*) FILTER (WHERE embedding_scheme = 'nomic-embed-text|prefixed-v1') scheme_ok
+      FROM core.bank_rulebook WHERE retired_at IS NULL GROUP BY 1, 2;" \
+  -c "SELECT status, count(*), count(last_error) AS errors FROM core.embedding_job GROUP BY 1;"
 ```
+
+`active`, `embedded` and `scheme_ok` should be equal, and every job `COMPLETED` with 0 errors. This must pass before Step 8: a rule without a vector can't be found.
 
 The script is safe to re-run. Unchanged rules that already have embeddings are not re-queued.
 
@@ -337,28 +371,30 @@ The script is safe to re-run. Unchanged rules that already have embeddings are n
 ```zsh
 curl -s -X POST http://localhost:8000/api/v1/chat \
   -H "Content-Type: application/json" \
-  -d '{"query": "Is there a fee for purchases made in a foreign currency?"}'
+  -d '{"query": "What is the late payment fee?"}'
 ```
 
-Expected response (the wording of `response` varies between runs):
+Expected response (rule IDs and the wording of `response` vary between runs):
 
 ```json
 {
   "status": "SUCCESS",
-  "matched_rules": ["FEE-FX-001", "FEE-LATE-005"],
-  "similarity_score": 0.753,
-  "latency_ms": 3418,
-  "response": "There is a 3.5% currency conversion fee for cross-border transactions settled in a foreign currency.\n\nOfficial Proof: BIAN Domain, Rule FEE-FX-001."
+  "matched_rules": ["CHASE-27861EF6C640", "CHASE-E6F3EC34B6F5"],
+  "similarity_score": 0.837,
+  "latency_ms": 1842,
+  "response": "If the minimum payment is not received by 5:00 PM ... a late fee of up to $40 ...\n\nOfficial Proof: ..."
 }
 ```
 
-More questions to try:
+More questions to try (scores measured on the built-in corpus, 2026-11-20):
 
 | Question | Expected `status` | Why |
 |---|---|---|
-| `What is the late payment fee?` | `SUCCESS` (score ≈ 0.80) | Directly matches `FEE-LATE-005` |
-| `Do you offer airport lounge access?` | `ABSTAINED` (score ≈ 0.44) | No rule covers it, so the assistant declines |
-| `What fee will I be charged if I swipe my card for sushi in Tokyo?` | `ABSTAINED` (score ≈ 0.60) | Finds the right rule, but conversational phrasing scores below the 0.70 threshold. See [Tuning the threshold](#tuning-the-confidence-threshold) |
+| `How long do I have to dispute a billing error?` | `SUCCESS` (≈ 0.87) | Matches the billing-error dispute rule |
+| Same late-fee question again | `SUCCESS`, much faster | The question vector comes from `api.query_embedding_cache` |
+| `Do you offer airport lounge access?` | `ABSTAINED` (≈ 0.58) | No rule covers it, so the assistant declines |
+| `Is there a fee for purchases made in a foreign currency?` | `SUCCESS` only if an FX rule was extracted | The built-in corpus has an FX clause, but extraction can drop it (see [Known issues](#known-issues)); then the best match scores ≈ 0.66 and the assistant correctly declines |
+| Any question with `"vendor_id": "HDFC"` on a CHASE-only rulebook | `ABSTAINED`, `matched_rules: []` | Search is restricted to the request's vendor and tier |
 
 Optional request fields:
 
@@ -419,13 +455,18 @@ docker compose --profile app up -d --build embedding-worker   # or: orchestrator
 
 ### Changing the database schema
 
-Files in `sql/` only run on an **empty** volume. For an existing database, apply a new or changed script by hand:
+Files in `sql/` only run on an **empty** volume. For an existing database, re-apply **03 through 07 together, in order**. They are idempotent as a set:
 
 ```zsh
-docker exec -i bank_postgres psql -v ON_ERROR_STOP=1 -U postgres -d bank_aidb < sql/03_embeddings_api.sql
+for f in 03_embeddings_api 04_rule_identity 05_embedding_scheme 06_rule_lifecycle 07_vector_search_settings; do
+  docker exec -i bank_postgres psql -q -v ON_ERROR_STOP=1 -U postgres -d bank_aidb < sql/$f.sql || break
+done
+docker compose --profile app up -d --force-recreate orchestrator
 ```
 
-Or reset the volume to re-run everything from scratch (see [Stopping and resetting](#stopping-and-resetting)).
+> ⚠️ Never re-apply `03` or `04` on their own. `03` recreates `api.rulebook_vw` without the `retired_at` filter (the assistant would cite retired rules) and brings back the unfiltered HNSW index; `04` gives `rule_loader` `DELETE` again. `06` and later undo both, which is why the whole range must run.
+
+Recreating the orchestrator makes its pooled connections pick up role settings such as `07`'s `hnsw.iterative_scan`. Or reset the volume to re-run everything from scratch (see [Stopping and resetting](#stopping-and-resetting)).
 
 ### Useful commands
 
@@ -435,6 +476,167 @@ docker logs -f bank_orchestrator                    # API logs and tracebacks
 docker logs -f bank_embedding_worker                # embedding events
 docker exec -it bank_postgres psql -U postgres -d bank_aidb   # SQL shell
 ```
+
+---
+
+## End-to-end verification
+
+Run this before committing changes to `sql/`, the worker, the orchestrator or the ingestion script. It rebuilds the database from scratch and exercises every stage, from the init scripts to the audit log. The last full pass was on 2026-11-20; everything passed except the items in [Known issues](#known-issues).
+
+It needs about 10 minutes with Ollama on the GPU (`./ollama-mode.sh gpu`). Run the phases in one terminal, with the venv active.
+
+### Phase 0: Unit tests and backup
+
+```zsh
+python -m py_compile ingestion/parse_disclosure.py orchestrator/app.py workers/embedding_worker.py && echo COMPILE_OK
+python -m pytest tests -q
+```
+
+✅ `COMPILE_OK` and all tests pass.
+
+Phase 1 wipes the database volume. If it holds rules you want to keep, copy it first:
+
+```zsh
+docker compose --profile app down
+docker volume create pgdata_backup
+docker run --rm -v pgvector-cardholder-rules-assistant_pgdata:/from -v pgdata_backup:/to alpine sh -c 'cp -a /from/. /to/ && echo BACKUP_OK'
+```
+
+### Phase 1: Fresh database, schema and privileges
+
+```zsh
+docker volume rm pgvector-cardholder-rules-assistant_pgdata
+docker compose --profile app up -d --build
+docker logs bank_postgres 2>&1 | grep -E 'running /docker|ignoring|ERROR'
+```
+
+✅ `01`–`07` show `running`, `Test_client_api` shows `ignoring`, and there are no `ERROR` lines.
+
+```zsh
+docker exec -i bank_postgres psql -U postgres -d bank_aidb -At <<'SQL'
+SELECT 'view filters retired (t):      '||(pg_get_viewdef('api.rulebook_vw') LIKE '%retired_at IS NULL%');
+SELECT 'active-only HNSW index (t):    '||EXISTS(SELECT 1 FROM pg_indexes WHERE indexname='bank_rulebook_embedding_active_hnsw');
+SELECT 'old unfiltered index (f):      '||EXISTS(SELECT 1 FROM pg_indexes WHERE indexname='bank_rulebook_embedding_hnsw');
+SELECT 'assistant iterative scan (t):  '||(SELECT 'hnsw.iterative_scan=strict_order' = ANY(rolconfig) FROM pg_roles WHERE rolname='mcp_assistant');
+SELECT 'loader DELETE (f):             '||has_table_privilege('rule_loader','core.bank_rulebook','DELETE');
+SELECT 'worker UPDATE scheme (t):      '||has_column_privilege('embed_worker','core.bank_rulebook','embedding_scheme','UPDATE');
+SELECT 'worker UPDATE clause (f):      '||has_column_privilege('embed_worker','core.bank_rulebook','clause_text','UPDATE');
+SELECT 'worker api schema (f):         '||has_schema_privilege('embed_worker','api','USAGE');
+SELECT 'assistant SELECT audit (t):    '||has_table_privilege('mcp_assistant','api.chat_audit_log','SELECT');
+SELECT 'assistant UPDATE audit (f):    '||has_table_privilege('mcp_assistant','api.chat_audit_log','UPDATE');
+SQL
+```
+
+✅ Every line ends with the value in brackets. Then re-apply 03–07 with the loop in [Changing the database schema](#changing-the-database-schema) and run the same check again. The results must not change.
+
+### Phase 2: Ingestion, embedding and chat
+
+Run [Step 7](#step-7-load-the-rulebook) and its embedding check, then:
+
+```zsh
+ask(){ curl -s -X POST http://localhost:8000/api/v1/chat -H 'Content-Type: application/json' -d "$1" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['status'],round(d.get('similarity_score') or 0,3),d['latency_ms'],'ms',d['matched_rules'])"; }
+ask '{"query":"What is the late payment fee?"}'
+ask '{"query":"What is the late payment fee?"}'
+ask '{"query":"Do you offer airport lounge access?"}'
+ask '{"query":"What is the late payment fee?","vendor_id":"HDFC"}'
+for i in {1..12}; do curl -s -o /dev/null -w "%{http_code} " -X POST http://localhost:8000/api/v1/chat -H 'Content-Type: application/json' -d "{\"query\":\"What is the cash advance fee $i?\"}" & done; wait; echo
+docker exec bank_postgres psql -U postgres -d bank_aidb -c "SELECT execution_status, count(*) FROM api.chat_audit_log GROUP BY 1;" -c "SELECT DISTINCT model_id FROM api.query_embedding_cache;"
+```
+
+✅
+- `SUCCESS ≈0.84` twice, the second call much faster (served from the cache).
+- `ABSTAINED` for the lounge question and for the HDFC question (empty `[]`).
+- Twelve `200`s from the concurrent burst, even though the pool has 10 connections.
+- One audit row per request, and the cache `model_id` is `nomic-embed-text|prefixed-v1`.
+
+### Phase 3: Ingestion guards and rule lifecycle
+
+These checks use a throwaway test vendor, `ACME`, so real vendors are never touched. Create the test documents (zsh):
+
+```zsh
+T=$(mktemp -d); mkdir -p $T/v1 $T/v2 $T/empty $T/bad $T/partial
+H="ACME Bank Credit Card Cardholder Agreement. This credit card account is governed by the following terms."
+FX="Foreign Transaction Fee: Purchases made in a foreign currency incur a fee of 3% of each transaction."
+BODY=(
+  "Annual Fee: The annual fee for this credit card is \$95, charged on the first billing cycle."
+  "Late Fee: If your minimum payment is not received by the due date, a late fee of \$40 is charged."
+  "Cash Advance Fee: Each cash advance costs 5% of the amount or \$10, whichever is greater."
+  "Balance Transfer Fee: Each balance transfer costs 4% of the amount transferred."
+  "Grace Period: You have at least 25 days after the close of each billing cycle to pay purchases without interest."
+  "Purchase APR: The APR for purchases is 21.99%. Penalty APR of 29.99% may apply after a late payment."
+)
+printf "%s\n\n" "$H" "$FX" "${BODY[@]}" > $T/v1/acme_agreement_2025.txt
+printf "%s\n\n" "$H" "${BODY[@]}" > $T/v2/acme_terms_2026.txt
+echo "A recipe for pancakes: mix flour and eggs." > $T/bad/notes.txt
+printf "%s\n\n%s\n" "ACME Bank credit card cardholder agreement. Credit card account terms: annual fee, late fee, billing cycle, minimum payment, APR." "${BODY[2]}" > $T/partial/fees_only.txt
+```
+
+`$T` exists only in this terminal. v2 is the same agreement under a new file name, with the FX clause removed.
+
+| # | Command | ✅ Pass when |
+|---|---|---|
+| 1 | `python ingestion/parse_disclosure.py --vendor ACME --dir $T/empty; echo EXIT=$?` | `EXIT=1`, `no supported files`. Never falls back to the built-in corpus |
+| 2 | `python ingestion/parse_disclosure.py --vendor ACME --source $T/bad/notes.txt; echo EXIT=$?` | `EXIT=2`, failure stage `[relevance]` (not `[read]`, which means `$T` is empty), `nothing retired` |
+| 3 | `python ingestion/parse_disclosure.py --vendor ACME --dir $T/v1` then `ask '{"query":"Is there a fee for purchases in a foreign currency?","vendor_id":"ACME"}'` | `EXIT=0`, about 6 rules, FX question `SUCCESS` |
+| 4 | `python ingestion/parse_disclosure.py --vendor ACME --dir $T/v2` then the same `ask` | `🗄️ retired ... Foreign Transaction Fee` with a `retired_reason` naming the run and `acme_terms_2026.txt`; FX question now `ABSTAINED` |
+| 5 | `python ingestion/parse_disclosure.py --vendor ACME --dir $T/v1 --no-retire` then the same `ask` | The FX rule is active again with its old embedding and **no new** `embedding_job` row; FX question `SUCCESS` |
+| 6 | `python ingestion/parse_disclosure.py --vendor ACME --dir $T/partial` | `🛑 retire skipped ... over PRUNE_MAX_DROP_RATIO=50%`; ACME's active rules and every other vendor unchanged |
+
+The model may reword a clause between runs. The reworded version gets a new rule ID, so step 4 can also retire a rule other than FX. That's expected: rule IDs are hashes of the clause text.
+
+To check step 5:
+
+```zsh
+docker exec bank_postgres psql -U postgres -d bank_aidb -c "SELECT r.rule_id, r.retired_at IS NOT NULL AS retired, r.embedding IS NOT NULL AS embedded, (SELECT count(*) FROM core.embedding_job j WHERE j.rule_id = r.rule_id) AS jobs FROM core.bank_rulebook r WHERE vendor_id = 'ACME' AND rule_title ILIKE '%foreign%';"
+```
+
+### Phase 4: Worker catch-up
+
+Stop the worker, insert a rule (its `NOTIFY` is missed), mark another rule as embedded with an old scheme, then start the worker again:
+
+```zsh
+docker stop bank_embedding_worker
+docker exec bank_postgres psql -U postgres -d bank_aidb -c "INSERT INTO core.bank_rulebook (rule_id, bian_domain, card_tier, vendor_id, rule_title, clause_text, category_code, source_doc) VALUES ('ACME-MISSED-1', 'Payment Execution', 'standard_credit', 'ACME', 'Returned Payment Fee', 'A returned payment costs \$35.', 'FEE', 'manual');" -c "UPDATE core.bank_rulebook SET embedding_scheme = 'nomic-embed-text|legacy' WHERE vendor_id = 'CHASE' AND rule_title ILIKE '%late%';"
+docker start bank_embedding_worker; sleep 8; docker logs --tail 5 bank_embedding_worker
+```
+
+✅ `🧹 [Worker Sweep] N rule(s) need embedding` followed by `✅` for `ACME-MISSED-1` and for the legacy-scheme CHASE rule(s). Retired rules are skipped.
+
+### Phase 5: Clean up
+
+```zsh
+docker exec bank_postgres psql -U postgres -d bank_aidb -c "DELETE FROM core.bank_rulebook WHERE vendor_id = 'ACME';"
+rm -rf "$T"
+```
+
+To return to the data you backed up in Phase 0:
+
+```zsh
+docker compose --profile app down
+docker volume rm pgvector-cardholder-rules-assistant_pgdata
+docker volume create pgvector-cardholder-rules-assistant_pgdata
+docker run --rm -v pgdata_backup:/from -v pgvector-cardholder-rules-assistant_pgdata:/to alpine sh -c 'cp -a /from/. /to/ && echo RESTORE_OK'
+docker compose --profile app up -d
+```
+
+Remove the backup with `docker volume rm pgdata_backup` once you no longer need it.
+
+---
+
+## Known issues
+
+Found in the 2026-11-20 end-to-end run. None of them blocks normal use.
+
+| Issue | Effect | Workaround until fixed |
+|---|---|---|
+| Orchestrator pool after a Postgres restart | The pool still holds dead connections. Each request uses up two (retrieval, then the audit insert), so the first ~`DB_POOL_MAX`/2 requests (5 by default) fail with HTTP 500 **and are not audited**, then the pool recovers | After restarting Postgres, also run `docker compose --profile app restart orchestrator`. Planned fix: retry once on a fresh connection in `db_cursor` |
+| Re-applying `03` or `04` alone | Undoes `06`: the view shows retired rules again, or `rule_loader` regains `DELETE` | Always re-apply 03–07 together ([Changing the database schema](#changing-the-database-schema)) |
+| Refused retiring exits `0` | The partial-snapshot guard logs `🛑 retire skipped` but the run still succeeds, so automation doesn't notice | Check run logs for `retire_skipped` |
+| `MAX_RULES_PER_CHUNK` (10) can drop clauses | A dense chunk that hits the cap loses its remaining rules (the built-in corpus's FX fee is often lost this way) | Raise `MAX_RULES_PER_CHUNK` in `.env`, or use smaller chunks |
+| Overlapping chunks re-extract a clause | The same rule is written twice; the second, sometimes worse, title wins (seen: `Ishonored Check Fee`) | Data Quality checks (see [Not covered yet](#not-covered-yet)) |
+| `SUCCESS` answers that are refusals | `llama3.2:3b` sometimes replies "I cannot provide financial advice" despite a confident match | Prompt or model tuning; find them in `api.chat_audit_log` |
+| `mcp_assistant` can read `core.bank_rulebook` directly | Granted in `02_schema.sql`; the app only uses the view, but the role could read retired rules | Planned: revoke it and rely on `api.rulebook_vw` |
+| Worker exits when the DB connection drops | Nothing is lost: `restart: always` restarts it and the startup sweep embeds anything missed | None needed |
 
 ---
 
@@ -448,6 +650,7 @@ docker exec -it bank_postgres psql -U postgres -d bank_aidb   # SQL shell
 | `APP_DB_PASSWORD` | `.env` | generated | `mcp_assistant` password (orchestrator container) |
 | `OLLAMA_HOST` | `.env` (set by `./ollama-mode.sh`) | `http://127.0.0.1:11434` | Ollama used by the ingestion script. `127.0.0.1` is the native Ollama.app (GPU). `[::1]` is the `bank_ollama` container (CPU) |
 | `CONTAINER_OLLAMA_HOST` | `.env` (set by `./ollama-mode.sh`) | `http://ollama:11434` | Ollama used by the worker and orchestrator. `host.docker.internal` is Ollama.app (GPU). `ollama` is the container (CPU) |
+| `DB_URI` | `docker-compose.yml` → `embedding-worker`, `orchestrator` | built from `.env` | Database connection for the worker (`embed_worker`) and the orchestrator (`mcp_assistant`). **Required**, with no default in code: if it's missing, the service stops with `DB_URI is not set` |
 | `CONFIDENCE_THRESHOLD` | `docker-compose.yml` → `orchestrator` | `0.70` | Minimum cosine similarity needed to answer |
 | `DB_POOL_MAX` / `DB_POOL_MIN` | orchestrator environment | `10` / same as max | Postgres connection pool size. A request borrows a connection only for retrieval and for the audit insert, never during the LLM call; extra requests wait for a free one. Keep `DB_POOL_MAX` × orchestrator replicas below Postgres `max_connections`. Idle connections above `DB_POOL_MIN` are closed, so lowering it trades reconnects for fewer open connections |
 | `EMBED_MODEL` / `MODEL_ID` | `orchestrator/app.py` / `workers/embedding_worker.py` | `nomic-embed-text` | Must match in both files, and must output 768 dimensions (or change `vector(768)` in `sql/03_embeddings_api.sql`) |
@@ -485,6 +688,35 @@ Tune it against a realistic set of questions once the rulebook has more than a h
 
 ---
 
+## Secrets and credentials
+
+- **`.env` is the only place passwords live.** It's git-ignored, and it has never been committed. Before every push, `git ls-files .env` must print nothing.
+- **No credentials in code.** The worker and orchestrator read `DB_URI` from the environment only, and `docker-compose.yml` builds it from `.env`. The ingestion script reads `LOADER_DB_PASSWORD` from the environment or `.env`. Never add a fallback connection string with a password, even a placeholder: secret scanners flag it, and a missing variable would silently use it.
+- **Turn on GitHub protection.** In the repository's **Settings → Code security**, enable *Secret scanning* and *Push protection*, so a pushed secret is blocked before it lands. Locally, a `gitleaks` pre-commit hook (`brew install gitleaks`) catches it earlier.
+- **Production.** Keep these values in a secrets manager (Vault, AWS Secrets Manager) or Docker secrets, not a `.env` file.
+
+### Rotating a database password
+
+Postgres reads the `.env` passwords only when the volume is first created, so editing `.env` alone breaks logins (`password authentication failed`). Change the password in the database first, then in `.env`, then recreate the service that uses it:
+
+```zsh
+NEW=$(openssl rand -hex 16)
+docker exec bank_postgres psql -U postgres -d bank_aidb -c "ALTER ROLE mcp_assistant PASSWORD '$NEW';"
+sed -i '' "s/^APP_DB_PASSWORD=.*/APP_DB_PASSWORD=$NEW/" .env
+docker compose --profile app up -d orchestrator
+```
+
+| Role | `.env` key | Then |
+|---|---|---|
+| `mcp_assistant` | `APP_DB_PASSWORD` | `docker compose --profile app up -d orchestrator` |
+| `embed_worker` | `WORKER_DB_PASSWORD` | `docker compose --profile app up -d embedding-worker` |
+| `rule_loader` | `LOADER_DB_PASSWORD` | Nothing: the next ingestion run reads `.env` |
+| `postgres` | `POSTGRES_PASSWORD` | Nothing: used only for admin access |
+
+✅ **Check:** `docker logs --tail 3 bank_orchestrator` shows no `password authentication failed`, and a chat request returns `SUCCESS` or `ABSTAINED`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -498,7 +730,11 @@ Tune it against a realistic set of questions once the rulebook has more than a h
 | `Error response from daemon: No such container: bank_embedding_worker` | App profile not started | `docker compose --profile app up -d --build` |
 | `docker logs` shows nothing for a running Python container | Output buffering | Both Dockerfiles set `ENV PYTHONUNBUFFERED=1`. Rebuild if you removed it |
 | `LOADER_DB_PASSWORD is not set` in `docker logs bank_postgres` | DB first started without `.env` | Create `.env` (Step 3), then reset the volume |
-| `password authentication failed for user …` | `.env` changed after the volume was created, or a hardcoded old password | Passwords are fixed at first init. Restore the old `.env` or reset the volume |
+| `password authentication failed for user …` | `.env` changed after the volume was created | Passwords are fixed at first init. Restore the old `.env`, or change it properly with `ALTER ROLE` (see [Rotating a database password](#rotating-a-database-password)) |
+| `DB_URI is not set` in a container log, or when running a service by hand | The worker or orchestrator was started without `DB_URI` | Start them with `docker compose --profile app up -d`, or export `DB_URI` first |
+| `no such service: #` from `docker compose` | zsh passed a trailing `# comment` as arguments | `setopt interactivecomments`, or paste the command without the comment |
+| `FileNotFoundError: no such file: /v1/...` (path starts at `/`) | A shell variable such as `$S` or `$T` is empty in this terminal | Set it again in this terminal (`echo $S` to check) |
+| `HTTP 500` on the first few chats after a Postgres restart | The orchestrator's pool still holds dead connections (see [Known issues](#known-issues)) | `docker compose --profile app restart orchestrator` |
 | `relation "core.bank_rulebook" / "api.…" does not exist` | Volume created before that `sql/` file existed | Apply the file by hand (see [Changing the database schema](#changing-the-database-schema)) or reset the volume |
 | `HTTP 500` from `/api/v1/chat` | Unhandled DB error | `docker logs bank_orchestrator` shows the traceback |
 | `"status": "ERROR"` with `model "…" not found` | Model not pulled | Step 5 |
