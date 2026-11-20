@@ -11,15 +11,16 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 1. [How it works](#how-it-works)
 2. [Ingestion pipeline](#ingestion-pipeline)
 3. [Project layout](#project-layout)
-4. [Prerequisites](#prerequisites)
-5. [Step-by-step setup and execution](#step-by-step-setup-and-execution)
-6. [Day-to-day operations](#day-to-day-operations)
-7. [End-to-end verification](#end-to-end-verification)
-8. [Known issues](#known-issues)
-9. [Configuration reference](#configuration-reference)
-10. [Secrets and credentials](#secrets-and-credentials)
-11. [Troubleshooting](#troubleshooting)
-12. [Stopping and resetting](#stopping-and-resetting)
+4. [How the code works](#how-the-code-works)
+5. [Prerequisites](#prerequisites)
+6. [Step-by-step setup and execution](#step-by-step-setup-and-execution)
+7. [Day-to-day operations](#day-to-day-operations)
+8. [End-to-end verification](#end-to-end-verification)
+9. [Known issues](#known-issues)
+10. [Configuration reference](#configuration-reference)
+11. [Secrets and credentials](#secrets-and-credentials)
+12. [Troubleshooting](#troubleshooting)
+13. [Stopping and resetting](#stopping-and-resetting)
 
 ---
 
@@ -174,6 +175,181 @@ These are judgment calls rather than hard rules, so they are planned for the Dat
     ├── app.py
     └── requirements.txt
 ```
+
+---
+
+## How the code works
+
+This section explains the three programs in plain language: what each one is for, what it does step by step, and why it's built that way. Function names are given in `code` so you can find each part in the file.
+
+### The words you'll see
+
+| Term | What it means here |
+|---|---|
+| **LLM** (large language model) | The AI that reads and writes text. Here it's `llama3.2:3b`, a small model that runs on your own machine. |
+| **Ollama** | The program that runs the AI models locally. The code sends it requests such as "read this and answer" or "turn this text into numbers". |
+| **Embedding** (or **vector**) | A list of 768 numbers that captures the *meaning* of a piece of text. Texts with similar meanings get similar numbers, even when they use different words ("late fee" ≈ "penalty for paying after the due date"). Made by the `nomic-embed-text` model. |
+| **Similarity score** | How close two embeddings are, from about 0 (unrelated) to 1 (same meaning). |
+| **Chunk** | A slice of a long document, about one page of text, small enough for the AI to read carefully. |
+| **Upsert** | "Insert, or update if it already exists." Saving the same rule twice changes one row instead of creating a duplicate. |
+| **Hash** (fingerprint) | A short code calculated from a piece of text. The same text always gives the same code; any change gives a different one. |
+| **Trigger, `NOTIFY` / `LISTEN`** | A database doorbell. When a rule is saved, a trigger rings the bell (`NOTIFY`); the worker is waiting for it (`LISTEN`). |
+| **Connection pool** | A set of database connections kept open and reused, like keeping phone lines open instead of dialling for every call. |
+| **Cache** | A store of answers already worked out, so the same work isn't repeated. |
+
+### How the three programs fit together
+
+```
+ Life of a rule:     document ─► parse_disclosure.py ─► core.bank_rulebook ─(doorbell)─► embedding_worker.py ─► rule gets its 768 numbers
+ Life of a question: customer ─► app.py ─► question gets its 768 numbers ─► 2 closest rules ─► AI explains them (or politely declines) ─► audit log
+```
+
+The three programs never call each other directly. They share the database: the ingestion script writes rules, the worker adds their embeddings, and the orchestrator reads both.
+
+---
+
+### `ingestion/parse_disclosure.py`: the rule extractor
+
+**In one sentence:** it reads a bank's credit card terms (PDF, text or Markdown), asks the AI to list every rule it finds, double-checks the AI's work, saves each rule in the rulebook, and archives rules that no longer appear in the bank's current documents.
+
+**Who runs it:** you, from the terminal (`python ingestion/parse_disclosure.py ...`). It runs once and exits; it isn't a background service.
+
+Think of it as a careful clerk with a stack of terms-and-conditions booklets. The clerk splits each booklet into pages, has an assistant (the AI) write down every rule on each page, checks the assistant's numbers against the page, files each rule card in the rulebook cabinet, and moves cards that are no longer in any booklet to an archive drawer.
+
+#### What happens, step by step
+
+1. **Read the settings** (`env`). Settings come from your shell first, then from `.env`. The database login is always `rule_loader`, a limited account that can add and update rules but never delete them. A required setting that's missing, such as `LOADER_DB_PASSWORD`, stops the script with a clear message.
+
+2. **Open a run log** (`setup_logging`). Every run gets an ID such as `20-Nov-2026_21-17-45_ab12cd` and a folder under `logs/`:
+   - The **terminal** shows short progress lines.
+   - **`run.jsonl`** records every detail, one line per event, tagged with which document and which chunk it was working on (`_ContextFilter`, `_JsonFormatter`).
+   - **`failed/`** holds a file for each piece that failed, so it can be investigated or retried later.
+
+3. **Check the AI is ready** (`preflight`). Before any real work, it confirms Ollama is reachable and the model is installed, then "warms up" the model so the first real request isn't slow. It also checks whether the model is running on the graphics chip (fast) or only on the processor (slow), and warns you if it's slow. If Ollama is down or the model is missing, it stops at once with exit code 1.
+
+4. **Collect the documents** (`run`):
+   - `--source` takes one file or web link.
+   - `--dir` takes every `.pdf`, `.txt` and `.md` file in a folder.
+   - With neither, it uses a built-in sample (`SYNTHETIC_DISCLOSURE_CORPUS`) for demos.
+   - An empty folder is an error. It never quietly falls back to the sample, because the sample would then become that bank's entire rulebook.
+
+5. **Read each document safely** (`read_source_content`, `_download`, `read_pdf_text`). These checks stop bad input before the AI spends any time on it:
+   - Files or downloads over **25 MB** are refused, and downloads are stopped mid-way if they grow too large or take over **120 seconds**.
+   - PDFs over **200 pages** are refused, since a credit card terms document is never that long.
+   - A web link is treated as a PDF if its content starts with the PDF signature `%PDF-`, even when the website mislabels it. Web pages (login screens, error pages) are refused.
+   - Pages with no readable text (usually scanned images) are reported. A document with no text at all is recorded as a failure.
+
+6. **Make sure it's actually about credit cards** (`check_relevance`). This quick word check needs no AI. The text must mention a credit card, cardholder or card account, **and** at least 4 different card-specific terms (APR, annual fee, grace period, cash advance, late fee, and so on). A pancake recipe or a mortgage contract is refused here. `--skip-relevance-check` overrides it.
+
+7. **Cut it into chunks** (`chunk_document`, `_split_oversized`). A small AI reads better in small portions, so each document is cut at paragraph and section breaks into pieces of about **2,200 characters**. Each piece repeats the last **300** characters of the previous one, so a rule that sits across a cut is never lost. A paragraph that is itself too long is split at line breaks, then at sentence ends, and only cut mid-sentence as a last resort.
+
+8. **Ask the AI for the rules** (`extract_rules_from_chunk`). The AI gets strict instructions: list every rule, keep every number exactly as written, don't invent anything, and return at most 10 rules. Its answer must fill in a fixed form (`RuleExtractionBatch` / `ExtractedClause`), and Ollama won't let it write anything outside that form:
+   - **Category**: one of 16 fixed codes, such as `FEE`, `APR` or `DISPUTE` (`CATEGORY_CODES`).
+   - **BIAN domain**: one of 9 standard banking areas, such as "Payment Execution" (`BIAN_DOMAINS`).
+   - **Title**: up to 150 characters.
+   - **Clause text**: the rule itself, up to 2,000 characters.
+
+   The "creativity" setting (temperature) is 0, so the same chunk gets the same answer every time.
+
+9. **Check the AI's work.** Every answer is checked before it's used:
+   - An answer that was cut off, or doesn't fit the form, is treated as a failure (`ExtractionError`) and retried.
+   - **Number check** (`_is_grounded`): if a rule mentions a number (a fee, a percentage, a number of days) that doesn't appear in the original chunk, the AI made it up, so the rule is thrown away.
+   - Duplicate rules in the same chunk are dropped.
+
+10. **Give each rule a permanent ID** (`make_rule_id`, `_normalize_clause`). The ID is a fingerprint of the bank name, the card tier and the rule's text, for example `CHASE-27861EF6C640`. Before the fingerprint is taken, capital letters, quotation marks, extra spaces and trailing punctuation are ignored. The same rule therefore always gets the same ID, even if the AI picks a different title next time, and re-running never creates duplicates. A reworded rule gets a new ID.
+
+11. **Retry when something goes wrong** (`extract_with_retries`, `_extract_split`). A failed chunk gets up to three tries, each with a different approach:
+    1. **default**: the normal request.
+    2. **resample**: slightly more varied settings, which breaks the AI out of repeating itself in a loop.
+    3. **split**: cut the chunk in half and try each half. Rules from a half that works are kept, even if the other half fails.
+
+    A failure that's certain to repeat, such as Ollama being unreachable, isn't retried.
+
+12. **Save the rules** (`load_rules`). Rules are upserted into `core.bank_rulebook` after **each chunk**, so if you press Ctrl-C, everything finished so far is kept. Saving a rule:
+    - Stamps `last_seen_at` with the current time, which records "this rule is still in the bank's documents".
+    - Changes `updated_at` only if the rule's content really changed.
+    - **Brings back** a rule that had been archived, if it appears in the documents again.
+
+    Saving also rings the database doorbell, and the embedding worker takes over from there.
+
+13. **Record anything that failed** (`save_failure_artifact`, `_record_failed_parts`). Each failure gets a file in `logs/<run>/failed/` with the chunk text, the AI's raw reply to every attempt, and the error. You can see exactly what went wrong and retry just those pieces.
+
+14. **Archive rules the bank no longer has** (`snapshot_status`, `reconcile`, `retire_scope`, `_retire_verdict`, `db_now`). One run is treated as the bank's *complete* current rulebook for one card tier, however many files it spans. At the start of the run the database clock is noted (`db_now`). At the end, any active rule of that bank and tier that wasn't seen since then is **retired**: it's hidden from the assistant but kept, with the date and a reason. Rules are never deleted, so the audit log can always show exactly what a customer was told. Several safety checks decide whether archiving is allowed:
+    - If any chunk failed, archiving waits until `--retry-failed` fixes it (status `pending`).
+    - If a whole document couldn't be read, nothing is archived, because that document's rules would be archived wrongly (status `incomplete`).
+    - If the run was interrupted, or saved 0 rules, nothing is archived.
+    - If archiving would remove **more than half** of the bank's rules, it's refused, because you probably gave only some of its documents. `--force-retire` overrides this, and `--no-retire` turns archiving off.
+
+15. **Report and exit** (`_summarize`). It prints a summary, lists each failure with the stage where it happened (`read`, `limits`, `relevance`, `extract`, `db`), and prints the exact `--retry-failed` command to use. Exit codes: `0` success, `1` aborted, `2` some parts failed, `130` interrupted.
+
+16. **Retry mode** (`retry_failed`, `load_failed_chunks`, `load_prune_context`). `--retry-failed logs/<run>` re-processes only the pieces saved in that run's `failed/` folder, with the same bank and tier. If everything now succeeds, it finishes the archiving step the original run had to postpone.
+
+---
+
+### `workers/embedding_worker.py`: the indexer
+
+**In one sentence:** it waits for new or changed rules and gives each one its 768-number embedding, so the assistant can find rules by meaning rather than exact words.
+
+**Who runs it:** Docker, as the `bank_embedding_worker` container. It runs all the time in the background and restarts by itself if it stops.
+
+Think of it as a librarian. Whenever a new rule card is filed, the librarian writes a summary code on the card so it can later be found by topic, not just by its exact wording.
+
+#### Its parts
+
+| Part | What it does |
+|---|---|
+| Settings (top of file) | `DB_URI` (required: the database login, `embed_worker`, supplied by Docker), `OLLAMA_HOST` (where the AI runs), `MODEL_ID` (`nomic-embed-text`), and how often to sweep (`EMBED_SWEEP_INTERVAL_S`, 60 s) and how many rules per sweep (`EMBED_SWEEP_BATCH`, 200). |
+| `DOC_PREFIX`, `EMBED_SCHEME` | The embedding model is trained to tell "stored documents" apart from "questions about them". Rules are labelled `search_document: ` and questions `search_query: `, and matching the labels improves results. `EMBED_SCHEME` (`nomic-embed-text\|prefixed-v1`) is a version stamp for this recipe. It's saved with each embedding, so if the model or labels change, the worker knows which rules to redo. |
+| `build_document_text` | Builds the text that gets embedded: `search_document: {title} [{BIAN domain}]: {rule text}`. Including the title and domain gives the embedding more context than the rule text alone. |
+| `embed_rule` | Does the work for one rule: reads it, asks Ollama for its embedding, then saves the embedding and the version stamp. It also marks **every** open job for that rule as completed and adds one to the job's attempt count. If Ollama fails, the jobs are marked `FAILED` with the error message, so you can see why. If the rule no longer exists, there's nothing to do. |
+| `sweep` | The safety net. It finds every **active** rule that has no embedding, or has one made with an older recipe, oldest first, up to 200 at a time, and embeds them. It catches doorbells that rang while the worker was off, earlier failures, and recipe changes. If 3 rules fail in a row (usually Ollama is down), it stops and tries again on the next sweep, rather than marking every remaining rule as failed. Archived rules are skipped. |
+| `run_worker` | The main loop. It connects to the database and starts listening for the doorbell (`LISTEN rulebook_events`), runs one sweep straight away, then repeats forever: every 60 seconds run a sweep; otherwise wait up to 5 seconds for a doorbell, and for each one, embed that rule. It starts listening *before* the first sweep, so a rule saved in between is never missed. |
+
+#### What it deliberately doesn't do
+
+- **It never changes a rule's wording.** Its database account can only write the embedding, the version stamp and the update time.
+- **It never touches the question cache.** Cached questions depend only on the question, not on the rules.
+- **It doesn't survive a lost database connection.** If the connection drops, the program exits. Docker restarts it (`restart: always`), and the startup sweep catches up on anything missed, so no rule is left without an embedding.
+
+---
+
+### `orchestrator/app.py`: the chat service
+
+**In one sentence:** it takes a customer's question, finds the two most relevant active rules for that customer's card issuer and tier, and, only if they're a close enough match, has the AI explain them in plain words with a citation. Otherwise it politely declines. Every conversation is logged.
+
+**Who runs it:** Docker, as the `bank_orchestrator` container. It's a web service on port 8000. Clients send questions to `POST /api/v1/chat`, and `http://localhost:8000/docs` shows a page where you can try it.
+
+Think of it as the bank's front desk. The clerk can only quote from the official rulebook. They look up the most relevant rule cards, and if a card clearly answers the question, they explain it and point to the card. If nothing fits well enough, they say so and refer the customer to customer care, rather than guessing.
+
+#### Its parts
+
+| Part | What it does |
+|---|---|
+| Settings (top of file) | `DB_URI` (required: the database login, `mcp_assistant`, which can only read active rules and write to the log), `OLLAMA_HOST`, `CONFIDENCE_THRESHOLD` (0.70: the minimum similarity needed to answer), `DB_POOL_MAX` / `DB_POOL_MIN` (how many database connections to keep open, 10 by default), `EMBED_MODEL` (`nomic-embed-text`), `CHAT_MODEL` (`llama3.2:3b`), and `QUERY_PREFIX` / `QUERY_SCHEME` (the `search_query: ` label and version stamp, which must match the worker's). |
+| `lifespan` | Runs when the service starts and stops. On start it opens the pool of database connections (and refuses to start if `DB_URI` is missing); on stop it closes them. |
+| `_pool_slots` | A queue ticket system. If all 10 connections are busy, a new request waits its turn instead of failing. |
+| `db_cursor` | Borrows a connection for one short piece of database work. If the work succeeds it's saved (commit); if not, it's undone (rollback). Either way, the connection goes back to the pool. A broken connection is thrown away instead of being returned. |
+| `ChatRequest` | The request form a client fills in: `query` (the question, required), `customer_tier` (default `standard_credit`), `vendor_id` (default `CHASE`) and `session_id` (made up automatically if not given; used to group one customer's questions in the log). |
+| `get_query_vector` | Turns the question into its 768 numbers. It first checks the cache, which is keyed by a fingerprint of the version stamp plus the question with case and outer spaces ignored. If the question was asked in the last 24 hours, the stored numbers are reused, which saves an AI call. Otherwise it asks Ollama, with the `search_query: ` label, and stores the result. |
+| `retrieve_rules` | Finds the **2 rules** whose embeddings are closest to the question's. It searches only `api.rulebook_vw`, which shows active rules only, and only for the request's card issuer and tier. The similarity score is `1 − distance`. The database connection is handed back **before** the AI writes its answer, so one slow answer never ties up a connection. |
+| `handle_chat` (`POST /api/v1/chat`) | Handles each question, as described below. |
+
+#### What happens when a question arrives (`handle_chat`)
+
+1. **Find the closest rules** with `retrieve_rules`.
+2. **Decide whether to answer:**
+   - If no rules were found, or the best score is **below 0.70**, it returns a fixed message, "This inquiry falls outside the official credit card terms … Please contact customer care", with status **`ABSTAINED`**. The AI isn't called, so this takes a few milliseconds.
+   - Otherwise it builds an "evidence" list of the matched rules (domain, rule ID, title, text) and asks the AI to explain the answer simply, using **only** those rules, and to end with an `Official Proof:` line citing the BIAN domain and rule ID. The AI is told it's the bank's "Rulebook Translator" and must not guess or change numbers. Status **`SUCCESS`**.
+3. **If anything breaks** (database, Ollama), it answers with status **`ERROR`** and the reason.
+4. **Write the audit log**, whatever the outcome. One row goes into `api.chat_audit_log` with the session, tier, question, matched rule IDs, scores, the exact reply, the status, and how long it took. If this write itself fails, the request fails (HTTP 500), so an unrecorded answer is never given.
+5. **Reply** with JSON: `status`, `matched_rules`, `similarity_score` (the best score), `latency_ms` and `response`.
+
+#### Why it's built this way
+
+- **The AI never answers from memory.** It only sees the rules the search found, and it isn't called at all when the match is weak. That's what keeps answers tied to the official rulebook.
+- **Archived rules are invisible.** The view filters them out, so a rule removed from the bank's current documents stops being quoted immediately, while staying in the database for the audit trail.
+- **Busy periods are handled calmly.** The pool and the queue tickets let many customers ask at once without overloading the database.
+- **Known gap:** after Postgres restarts, the first few requests can fail until the pool replaces its broken connections. See [Known issues](#known-issues).
 
 ---
 
