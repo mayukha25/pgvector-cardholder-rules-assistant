@@ -158,7 +158,7 @@ def test_url_http_error_propagates(monkeypatch):
         pd.read_source_content("https://bank.example/missing.pdf")
 
 
-# --- safe pruning ---------------------------------------------------------
+# --- safe retiring (vendor snapshot) ---------------------------------------
 @pytest.mark.parametrize("seen,stale,prior,force,refused", [
     (0, 40, 40, False, True),    # nothing extracted: never prune
     (0, 40, 40, True, True),     # ...not even with --force-prune
@@ -170,5 +170,90 @@ def test_url_http_error_propagates(monkeypatch):
     (2, 3, 3, False, False),     # tiny documents skip the ratio check
     (12, 0, 0, False, False),    # first ingestion: nothing to prune
 ])
-def test_prune_verdict(seen, stale, prior, force, refused):
-    assert (pd._prune_verdict(seen, stale, prior, force) is not None) is refused
+def test_retire_verdict(seen, stale, prior, force, refused):
+    assert (pd._retire_verdict(seen, stale, prior, force) is not None) is refused
+
+
+@pytest.mark.parametrize("failed,status", [
+    ([], "complete"),
+    ([{"source": "a.pdf", "chunk": 3}], "pending"),                       # --retry-failed can finish it
+    ([{"source": "b.pdf", "chunk": None, "stage": "relevance"}], "incomplete"),  # a whole document missing
+    ([{"source": "a.pdf", "chunk": 3}, {"source": "b.pdf", "chunk": None}], "incomplete"),
+])
+def test_snapshot_status(failed, status):
+    assert pd.snapshot_status(failed) == status
+
+
+class _RetireCursor:
+    def __init__(self, counts, retired):
+        self.counts, self.retired, self.sql = counts, retired, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        self.sql.append((" ".join(sql.split()), params))
+
+    def fetchone(self):
+        return self.counts
+
+    def fetchall(self):
+        return self.retired
+
+
+class _RetireConn:
+    def __init__(self, cur):
+        self.cur, self.commits, self.rollbacks = cur, 0, 0
+
+    def cursor(self):
+        return self.cur
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+SCOPE = {"vendor": "HDFC", "tier": "international_credit",
+         "documents": ["agreement-2026.pdf", "fee-schedule.pdf"]}
+
+
+def test_retire_scope_retires_by_vendor_across_documents_and_never_deletes():
+    cur = _RetireCursor((40, 3, 40), [("HDFC-AAA", "Old FX fee", "agreement-2023.pdf")])
+    conn = _RetireConn(cur)
+    assert pd.retire_scope(conn, SCOPE, "2026-11-19T00:00:00+00:00") == 1
+    update_sql, params = cur.sql[-1]
+    assert update_sql.startswith("UPDATE core.bank_rulebook SET retired_at = NOW()")
+    assert not any("DELETE" in s for s, _ in cur.sql)
+    # Scoped by vendor + tier over active rules, not by file name: a rule from the 2023 PDF is retired
+    # by a snapshot made of differently named 2026 PDFs.
+    assert "vendor_id = %(vendor)s AND card_tier = %(tier)s AND retired_at IS NULL" in update_sql
+    assert "source_doc =" not in update_sql
+    assert "agreement-2026.pdf, fee-schedule.pdf" in params["reason"]
+    assert conn.commits == 1
+
+
+def test_retire_scope_refuses_partial_vendor_snapshot():
+    # Only the fee schedule was given: most of the vendor's agreement rules look stale.
+    cur = _RetireCursor((5, 38, 40), [])
+    conn = _RetireConn(cur)
+    assert pd.retire_scope(conn, SCOPE, "2026-11-19T00:00:00+00:00") == 0
+    assert len(cur.sql) == 1 and conn.rollbacks == 1  # counted, nothing updated
+
+
+def test_upsert_reactivates_a_retired_rule():
+    import inspect
+    src = inspect.getsource(pd.load_rules)
+    assert "retired_at    = NULL" in src and "retired_reason = NULL" in src
+
+
+def test_empty_dir_is_an_error_not_the_builtin_corpus(tmp_path, monkeypatch):
+    monkeypatch.setattr(pd, "preflight", lambda client: None)
+    monkeypatch.setattr(pd.psycopg2, "connect", lambda *a, **k: pytest.fail("must not touch the DB"))
+    args = pd.argparse.Namespace(source=None, dir=str(tmp_path), vendor="HDFC", tier="international_credit",
+                                 no_prune=False, force_prune=False, skip_relevance_check=False)
+    assert pd.run(args, tmp_path) == 1

@@ -57,7 +57,7 @@ LLM_NUM_PREDICT = int(env("LLM_NUM_PREDICT", "2048")) # stops runaway JSON gener
 LOG_DIR = Path(env("LOG_DIR", str(Path(__file__).resolve().parent.parent / "logs")))
 LOG_LEVEL = env("LOG_LEVEL", "INFO")
 
-# Input guards (see read_source_content / check_relevance / prune_scope)
+# Input guards (see read_source_content / check_relevance / retire_scope)
 MAX_SOURCE_MB = float(env("MAX_SOURCE_MB", "25"))            # per file or download
 MAX_PDF_PAGES = int(env("MAX_PDF_PAGES", "200"))
 DOWNLOAD_DEADLINE_S = float(env("DOWNLOAD_DEADLINE_S", "120"))  # whole download, not per read
@@ -643,7 +643,8 @@ Travel Cancellation & Interruption Protection: Reimburses up to $10,000 per cove
 # 4. Idempotent PostgreSQL Batch Loader
 # ---------------------------------------------------------------------------
 def load_rules(conn, rules: List[dict], source_doc: str):
-    """Upsert by content id. last_seen_at always moves (drives pruning); updated_at only on real change."""
+    """Upsert by content id. last_seen_at always moves (drives retiring); updated_at only on real change.
+    A retired rule that the vendor's documents contain again is reactivated."""
     if not rules:
         return
     rules = [{**r, "source_doc": source_doc} for r in rules]
@@ -664,6 +665,8 @@ def load_rules(conn, rules: List[dict], source_doc: str):
             rule_title    = EXCLUDED.rule_title,
             clause_text   = EXCLUDED.clause_text,
             last_seen_at  = NOW(),
+            retired_at    = NULL,
+            retired_reason = NULL,
             updated_at    = CASE
                 WHEN (rb.category_code, rb.bian_domain, rb.rule_title, rb.clause_text)
                      IS DISTINCT FROM
@@ -688,8 +691,20 @@ def load_rules(conn, rules: List[dict], source_doc: str):
 
 
 # ---------------------------------------------------------------------------
-# 5. Reconciliation: delete rules a complete run of a document no longer produces
+# 5. Reconciliation: a run is the vendor's complete rulebook for one card tier,
+#    across all of its PDFs. Active rules of that vendor+tier the run did not
+#    produce are retired (hidden from the assistant, kept for the audit trail).
 # ---------------------------------------------------------------------------
+def scope_label(scope: dict) -> str:
+    return f"{scope['vendor']}/{scope['tier']}"
+
+
+def snapshot_status(failed: list) -> str:
+    """'complete' (retire now), 'pending' (only chunks failed: --retry-failed can finish it) or
+    'incomplete' (a whole document is missing: retiring would drop its rules, so never)."""
+    if any(f.get("chunk") is None for f in failed):
+        return "incomplete"
+    return "pending" if failed else "complete"
 def db_now(conn):
     """Database clock at run start; rows seen by this run get last_seen_at >= this."""
     with conn.cursor() as cur:
@@ -699,65 +714,70 @@ def db_now(conn):
     return ts
 
 
-def _prune_verdict(seen: int, stale: int, prior: int, force: bool) -> "str | None":
-    """Return why pruning should be refused, or None if it is safe."""
+def _retire_verdict(seen: int, stale: int, prior: int, force: bool) -> "str | None":
+    """Return why retiring should be refused, or None if it is safe."""
     if seen == 0:
-        # A complete run that produced nothing is suspicious (wrong file, empty PDF, model issue).
-        return "this run saved 0 rules for it"
+        # A complete run that produced nothing is suspicious (wrong files, empty PDFs, model issue).
+        return "this run saved 0 rules for the vendor"
     if force:
         return None
     if prior >= PRUNE_MIN_PRIOR_ROWS and stale / prior > PRUNE_MAX_DROP_RATIO:
-        # Same file name, mostly different rules: a replaced/wrong file looks exactly like this.
-        return (f"it would delete {stale}/{prior} ({stale / prior:.0%}) of the existing rules, over "
-                f"PRUNE_MAX_DROP_RATIO={PRUNE_MAX_DROP_RATIO:.0%}; if the document really changed "
-                "that much, re-run with --force-prune")
+        # Usually only part of the vendor's documents were given (e.g. just the fee schedule).
+        return (f"it would retire {stale}/{prior} ({stale / prior:.0%}) of the vendor's active rules, over "
+                f"PRUNE_MAX_DROP_RATIO={PRUNE_MAX_DROP_RATIO:.0%}. A run must include ALL of the vendor's "
+                "current documents for this tier; if it does and the terms really changed that much, "
+                "re-run with --force-retire")
     return None
 
 
-def prune_scope(conn, scope: dict, seen_since, force: bool = False) -> int:
-    """Delete rows of one (vendor, tier, source_doc) that were not seen since `seen_since`."""
-    where = "vendor_id = %(vendor)s AND card_tier = %(tier)s AND source_doc = %(source_doc)s"
-    params = {**scope, "since": seen_since}
+def retire_scope(conn, scope: dict, seen_since, force: bool = False) -> int:
+    """Retire active rules of one vendor+tier that were not seen since `seen_since`."""
+    where = "vendor_id = %(vendor)s AND card_tier = %(tier)s AND retired_at IS NULL"
+    docs = ", ".join(scope.get("documents") or []) or "built-in corpus"
+    params = {**scope, "since": seen_since,
+              "reason": f"not in vendor snapshot run {_CTX.get('run_id')} ({docs})"}
     with conn.cursor() as cur:
         cur.execute(f"""SELECT count(*) FILTER (WHERE last_seen_at >= %(since)s),
                                count(*) FILTER (WHERE last_seen_at IS NULL OR last_seen_at < %(since)s),
                                count(*) FILTER (WHERE created_at < %(since)s)
                         FROM core.bank_rulebook WHERE {where}""", params)
         seen, stale, prior = cur.fetchone()
-        refusal = _prune_verdict(seen, stale, prior, force)
+        refusal = _retire_verdict(seen, stale, prior, force)
         if refusal:
             conn.rollback()
-            log.warning("🛑 prune skipped for %s: %s", scope["source_doc"], refusal,
-                        extra={"event": "prune_skipped", "scope": scope,
+            log.warning("🛑 retire skipped for %s: %s", scope_label(scope), refusal,
+                        extra={"event": "retire_skipped", "scope": scope,
                                "seen": seen, "stale": stale, "prior": prior})
             return 0
-        cur.execute(f"""DELETE FROM core.bank_rulebook
+        cur.execute(f"""UPDATE core.bank_rulebook
+                        SET retired_at = NOW(), retired_reason = %(reason)s
                         WHERE {where} AND (last_seen_at IS NULL OR last_seen_at < %(since)s)
-                        RETURNING rule_id, rule_title""", params)
-        deleted = cur.fetchall()
+                        RETURNING rule_id, rule_title, source_doc""", params)
+        retired = cur.fetchall()
     conn.commit()
-    for rule_id, title in deleted:
-        log.info("   🗑️ pruned %s -> %s", rule_id, title, extra={"rule_id": rule_id})
-    log.info("🧹 %s: kept %d rule(s), pruned %d stale rule(s) no longer in the document",
-             scope["source_doc"], seen, len(deleted),
-             extra={"event": "prune", "scope": scope, "kept": seen, "pruned": len(deleted)})
-    return len(deleted)
+    for rule_id, title, source_doc in retired:
+        log.info("   🗄️ retired %s -> %s (from %s)", rule_id, title, source_doc or "?",
+                 extra={"rule_id": rule_id})
+    log.info("🧹 %s: %d active rule(s), retired %d no longer in the vendor's documents",
+             scope_label(scope), seen, len(retired),
+             extra={"event": "retire", "scope": scope, "active": seen, "retired": len(retired)})
+    return len(retired)
 
 
-def reconcile(conn, complete: list, pending: list, seen_since, no_prune: bool,
-              force_prune: bool = False) -> None:
-    """Prune complete scopes now; record pending ones so --retry-failed can prune them later."""
+def reconcile(conn, complete: list, pending: list, seen_since, no_retire: bool,
+              force_retire: bool = False) -> None:
+    """Retire stale rules of complete vendor scopes now; record pending ones for --retry-failed."""
     for scope in complete:
-        if no_prune:
-            log.info("⏭️ --no-prune: stale rules for %s left in place", scope["source_doc"])
+        if no_retire:
+            log.info("⏭️ --no-retire: rules missing from %s's documents left active", scope_label(scope))
         else:
-            prune_scope(conn, scope, seen_since, force=force_prune)
+            retire_scope(conn, scope, seen_since, force=force_retire)
     if pending:
-        log.warning("⏸️ prune deferred for %s until --retry-failed clears their failed chunks",
-                    [s["source_doc"] for s in pending])
-    # Always written, so a retry run knows which scopes still await pruning and since when.
-    log.info("prune context", extra={"event": "prune_context", "seen_since": seen_since.isoformat(),
-                                     "pending": pending})
+        log.warning("⏸️ retiring deferred for %s until --retry-failed clears the failed chunks",
+                    [scope_label(s) for s in pending])
+    # Always written, so a retry run knows which scopes still await retiring and since when.
+    log.info("reconcile context", extra={"event": "prune_context", "seen_since": seen_since.isoformat(),
+                                         "pending": pending})
 
 
 def load_prune_context(prev_run_dir: Path):
@@ -824,12 +844,13 @@ def main():
                              "Vendor/tier default to that run's values.")
     parser.add_argument("--tier", type=str, default=None, help="Card tier (default: standard_credit)")
     parser.add_argument("--vendor", type=str, default=None, help="Issuing vendor ID (default: CHASE)")
-    parser.add_argument("--no-prune", action="store_true",
-                        help="Keep rules that this run no longer extracts (default: delete them per document "
-                             "once the document is fully processed without failures)")
-    parser.add_argument("--force-prune", action="store_true",
-                        help=f"Prune even if it would delete more than {PRUNE_MAX_DROP_RATIO * 100:.0f}%% of a document's "
-                             "existing rules (use when a document was substantially rewritten)")
+    parser.add_argument("--no-retire", "--no-prune", dest="no_prune", action="store_true",
+                        help="Keep the vendor's rules that this run no longer extracts active (default: the run "
+                             "is the vendor's complete rulebook for the tier, and rules missing from all of its "
+                             "documents are retired once every document is processed without failures)")
+    parser.add_argument("--force-retire", "--force-prune", dest="force_prune", action="store_true",
+                        help=f"Retire even if it would retire more than {PRUNE_MAX_DROP_RATIO * 100:.0f}%% of the "
+                             "vendor's active rules (use when the vendor's terms were substantially rewritten)")
     parser.add_argument("--skip-relevance-check", action="store_true",
                         help="Ingest sources even if they do not look like credit card disclosures")
     parser.add_argument("--log-level", default=LOG_LEVEL.upper(),
@@ -840,7 +861,7 @@ def main():
     if args.retry_failed and (args.source or args.dir):
         parser.error("--retry-failed cannot be combined with --source/--dir")
     if args.no_prune and args.force_prune:
-        parser.error("--no-prune and --force-prune are contradictory")
+        parser.error("--no-retire and --force-retire are contradictory")
     if not args.retry_failed:
         args.tier = args.tier or "standard_credit"
         args.vendor = args.vendor or "CHASE"
@@ -873,6 +894,10 @@ def run(args, run_dir: Path) -> int:
         candidates = [str(p) for p in sorted(Path(args.dir).glob("*"))
                       if p.suffix.lower() in SUPPORTED_SUFFIXES]
         log.info("📂 %d file(s) found in %s", len(candidates), args.dir)
+        if not candidates:
+            # Never fall back to the built-in corpus: it would become this vendor's whole rulebook.
+            log.critical("❌ no supported files (%s) in %s", ", ".join(sorted(SUPPORTED_SUFFIXES)), args.dir)
+            return 1
     else:
         log.info("ℹ️ No --source or --dir specified; extracting exhaustive rules from built-in Schumer Box & Bulletin corpus...")
         candidates = []
@@ -896,7 +921,9 @@ def run(args, run_dir: Path) -> int:
         log.info("📖 read %s (%d chars) in %.1fs", src, len(text), time.monotonic() - t0,
                  extra={"source": src, "chars": len(text)})
         if not text.strip():
-            log.warning("⚠️ %s produced no text; skipping", src)
+            # Recorded as a failure: a vendor document we could not read must not let its rules be retired.
+            log.error("❌ %s produced no text (scanned PDF?); skipping", src)
+            failed.append({"source": src, "chunk": None, "stage": "empty", "error": "no extractable text"})
             continue
         rel = check_relevance(text)
         log.debug("relevance check", extra={"source": src, **rel})
@@ -918,12 +945,16 @@ def run(args, run_dir: Path) -> int:
     log.debug("db connected", extra={"server_version": conn.server_version})
     seen_since = db_now(conn)
     total_rules, total_chunks, interrupted, run_start = 0, 0, False, time.monotonic()
-    complete, pending = [], []  # scopes (vendor, tier, source_doc) eligible for pruning
+    # One reconciliation scope for the whole run: every document given is part of the vendor's
+    # current rulebook for this tier, whatever the file names.
+    scope = {"vendor": args.vendor, "tier": args.tier,
+             "documents": [Path(s).name for s in candidates] or ["built_in_schumer_corpus"]}
+    log.info("🏦 vendor snapshot %s: %s", scope_label(scope), scope["documents"],
+             extra={"event": "snapshot", "scope": scope})
     try:
         for src_name, raw_text in sources_to_process:
             _CTX["source"] = Path(src_name).name
-            scope = {"vendor": args.vendor, "tier": args.tier, "source_doc": Path(src_name).name}
-            failures_before = len(failed)
+            source_doc = Path(src_name).name
             chunks = chunk_document(raw_text)
             log.info("🔍 Parsing '%s' (%d chunks) via %s...", src_name, len(chunks), EXTRACTION_MODEL,
                      extra={"chunks": len(chunks), "chunk_sizes": [len(c) for c in chunks]})
@@ -947,7 +978,7 @@ def run(args, run_dir: Path) -> int:
                 _record_failed_parts(run_dir, failed, src_name, f"{idx:04d}", failed_parts,
                                      args.vendor, args.tier)
                 try:
-                    load_rules(conn, batch, scope["source_doc"])  # saved per chunk
+                    load_rules(conn, batch, source_doc)  # saved per chunk
                 except psycopg2.Error as e:
                     artifact = save_failure_artifact(run_dir, src_name, idx, chunk, e,
                                                      args.vendor, args.tier, stage="db")
@@ -960,19 +991,29 @@ def run(args, run_dir: Path) -> int:
                     continue
                 total_rules += len(batch)
             _CTX.pop("chunk", None)
-            (pending if len(failed) > failures_before else complete).append(scope)
     except KeyboardInterrupt:
         interrupted = True
         log.warning("⏹️ Interrupted; rules from completed chunks are already saved.")
     finally:
         _CTX.pop("source", None)
         _CTX.pop("chunk", None)
+    status = snapshot_status(failed)
     try:
         if interrupted:
-            # Fully processed documents can still be pruned later by --retry-failed.
-            reconcile(conn, [], complete + pending, seen_since, args.no_prune)
+            # Unprocessed chunks were never attempted, so there is nothing --retry-failed could finish.
+            log.warning("⏹️ %s: nothing retired; re-run the vendor's documents", scope_label(scope))
+            reconcile(conn, [], [], seen_since, args.no_prune)
+        elif status == "incomplete":
+            missing = sorted({Path(f["source"]).name for f in failed if f.get("chunk") is None})
+            log.warning("🛑 %s: nothing retired; documents %s were not read, so their rules would be "
+                        "retired wrongly. Fix or remove them and re-run the vendor's documents",
+                        scope_label(scope), missing,
+                        extra={"event": "retire_skipped", "scope": scope, "missing": missing})
+            reconcile(conn, [], [], seen_since, args.no_prune)
+        elif status == "pending":
+            reconcile(conn, [], [scope], seen_since, args.no_prune)
         else:
-            reconcile(conn, complete, pending, seen_since, args.no_prune, args.force_prune)
+            reconcile(conn, [scope], [], seen_since, args.no_prune, args.force_prune)
     finally:
         conn.close()
 
@@ -1057,8 +1098,16 @@ def retry_failed(args, run_dir: Path) -> int:
         if seen_since is None:
             log.info("ℹ️ run %s predates pruning support; no stale-rule cleanup to finish", prev.name)
         else:
-            still_failing = {Path(f["source"]).name for f in failed}
-            done = [] if interrupted else [s for s in pending if s["source_doc"] not in still_failing]
+            legacy = [s for s in pending if "source_doc" in s]
+            if legacy:
+                # Per-document scopes from before vendor snapshots: finishing them now would treat
+                # one file as the vendor's whole rulebook.
+                log.warning("ℹ️ run %s predates vendor snapshots; nothing retired for %s. Re-run all of "
+                            "the vendor's documents to reconcile", prev.name,
+                            [s["source_doc"] for s in legacy])
+            pending = [s for s in pending if "source_doc" not in s]
+            # Any failure left means the vendor's snapshot still has holes.
+            done = [] if (interrupted or failed) else pending
             reconcile(conn, done, [s for s in pending if s not in done], seen_since, args.no_prune,
                       args.force_prune)
     finally:

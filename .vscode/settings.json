@@ -1,4 +1,37 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/venv/bin/python",
-  "python.terminal.activateEnvironment": true
+  "python.terminal.activateEnvironment": true,
+
+  // Local Docker Postgres (bank_postgres). Passwords are NOT stored here:
+  // the PostgreSQL extension prompts on first connect; values are in .env.
+  "pgsql.connections": [
+    {
+      "profileName": "bank_aidb (admin: postgres)",
+      "server": "127.0.0.1",
+      "port": "5432",
+      "database": "bank_aidb",
+      "user": "postgres",
+      "authenticationType": "SqlLogin",
+      "sslmode": "disable",
+      "id": "97FFD910-A59F-46F7-93BD-B7A2CD041462",
+      "groupId": "04F79E3C-2365-417F-B95B-4254D3F6F7B4",
+      "expiresOn": 0,
+      "password": "",
+      "sshPassword": ""
+    },
+    {
+      "profileName": "bank_aidb (app: mcp_assistant, read-only)",
+      "server": "127.0.0.1",
+      "port": "5432",
+      "database": "bank_aidb",
+      "user": "mcp_assistant",
+      "authenticationType": "SqlLogin",
+      "sslmode": "disable",
+      "id": "AC5DEBD8-0596-4768-A087-4C9F5D73AA12",
+      "groupId": "04F79E3C-2365-417F-B95B-4254D3F6F7B4",
+      "expiresOn": 0,
+      "password": "",
+      "sshPassword": ""
+    }
+  ]
 }

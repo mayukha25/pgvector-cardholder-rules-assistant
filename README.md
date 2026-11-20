@@ -44,8 +44,8 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 
 1. **Ingest.** `parse_disclosure.py` upserts rules into `core.bank_rulebook`.
 2. **Queue and notify.** A trigger creates a row in `core.embedding_job` and sends `NOTIFY rulebook_events` with the `rule_id` and `job_id`.
-3. **Embed.** The worker receives the event, embeds the rule text with `nomic-embed-text`, stores the vector, marks the job `COMPLETED`, and clears the query cache.
-4. **Answer.** The orchestrator embeds the question (cached for 24 hours), finds the two closest rules for the customer's card tier and vendor, and then does one of two things:
+3. **Embed.** The worker receives the event, embeds `search_document: {title} [{domain}]: {clause}` with `nomic-embed-text`, stores the vector and its `embedding_scheme`, marks the rule's open jobs `COMPLETED`, and clears the query cache. At startup and every `EMBED_SWEEP_INTERVAL_S` (60 s) it also embeds any rule with no vector or a vector from an older scheme. That catches events missed while the worker was down, failed jobs, and re-embeds everything after a model or prefix change.
+4. **Answer.** The orchestrator embeds `search_query: {question}` (cached for 24 hours), finds the two closest rules for the customer's card tier and vendor, and then does one of two things:
    - If the best similarity is **≥ `CONFIDENCE_THRESHOLD`** (0.70), `llama3.2:3b` writes an answer using only those rules → `SUCCESS`.
    - Otherwise it returns a fixed "contact customer care" message → `ABSTAINED`.
 5. **Audit.** Every request is written to `api.chat_audit_log`.
@@ -55,18 +55,18 @@ A fully local, air-gapped assistant that answers cardholder questions **only** f
 | Role | Used by | Can do |
 |---|---|---|
 | `postgres` | Admin / init scripts only | Everything |
-| `rule_loader` | `ingestion/parse_disclosure.py` | Insert, update and prune (delete) rules in `core.bank_rulebook` |
-| `embed_worker` | `workers/embedding_worker.py` | Read rules; write only `embedding`/`updated_at`; update jobs; truncate the query cache |
+| `rule_loader` | `ingestion/parse_disclosure.py` | Insert, update and retire rules in `core.bank_rulebook` (no delete) |
+| `embed_worker` | `workers/embedding_worker.py` | Read rules; write only `embedding`/`updated_at`; update jobs |
 | `mcp_assistant` | `orchestrator/app.py` | Read rules **only through** `api.rulebook_vw`; use the query cache; append to the audit log. 2-second statement timeout |
 
 ---
 
 ## Ingestion pipeline
 
-`ingestion/parse_disclosure.py` turns credit card disclosure documents into structured rules in `core.bank_rulebook`, using a local LLM through Ollama. Bad input is stopped before any model call, failures are retried and isolated, and existing rules are never deleted on weak evidence. A one-page version of this section is in [docs/ingestion-pipeline-summary.pdf](docs/ingestion-pipeline-summary.pdf).
+`ingestion/parse_disclosure.py` turns credit card disclosure documents into structured rules in `core.bank_rulebook`, using a local LLM through Ollama. Bad input is stopped before any model call, failures are retried and isolated, and rules are never deleted: a vendor's rules that its current documents no longer contain are retired, and only on strong evidence. A one-page version of this section is in [docs/ingestion-pipeline-summary.pdf](docs/ingestion-pipeline-summary.pdf).
 
 ```
-Input ─► Limits* ─► Text ─► Relevance* ─► Chunk ─► Extract* ─► Upsert ─► Prune*
+Input ─► Limits* ─► Text ─► Relevance* ─► Chunk ─► Extract* ─► Upsert ─► Retire*
                                               * can reject input or hold back changes
 ```
 
@@ -108,10 +108,10 @@ A rejected source is listed in the run summary and the run exits with code 2.
 - One failed chunk or source never stops the run. Each failure is saved to `logs/<run>/failed/` with the chunk text, the model's raw output from every attempt and the error.
 - `--retry-failed <run_dir>` reprocesses only those chunks. Ctrl-C stops the run but keeps every rule already saved.
 
-### Loading and pruning
+### Loading and retiring
 
-- Rules are upserted per chunk as `rule_loader`, with stable IDs, and only new or changed rules are queued for embedding. See [Adding or changing rules](#adding-or-changing-rules) for how re-runs and pruning behave.
-- Pruning is scoped to one document. It is deferred if any chunk failed or the run was interrupted, refused if the run saved 0 rules for the document, and refused if it would delete more than `PRUNE_MAX_DROP_RATIO` (50%) of the document's existing rules (`--force-prune` overrides; `--no-prune` disables).
+- Rules are upserted per chunk as `rule_loader`, with stable IDs, and only new or changed rules are queued for embedding. See [Adding or changing rules](#adding-or-changing-rules) for how re-runs and retiring behave.
+- A run is the vendor's **complete rulebook** for one tier, however many PDFs it spans and whatever they are named. Active rules of that vendor and tier that no document in the run produced are retired (`retired_at`, `retired_reason`), not deleted. Retiring is deferred if any chunk failed, skipped if a whole document could not be read or the run was interrupted, refused if the run saved 0 rules, and refused if it would retire more than `PRUNE_MAX_DROP_RATIO` (50%) of the vendor's active rules (`--force-retire` overrides; `--no-retire` disables).
 
 ### Logs and exit codes
 
@@ -148,7 +148,11 @@ These are judgment calls rather than hard rules, so they are planned for the Dat
 ├── sql/                      # run automatically, in order, on the FIRST start of an empty DB volume
 │   ├── 01_roles.sh           #   creates rule_loader, embed_worker, mcp_assistant
 │   ├── 02_schema.sql         #   extensions, core schema, core.bank_rulebook
-│   └── 03_embeddings_api.sql #   embedding column + HNSW index, job queue + trigger, api schema, grants
+│   ├── 03_embeddings_api.sql #   embedding column + HNSW index, job queue + trigger, api schema, grants
+│   ├── 04_rule_identity.sql  #   category_code, source_doc, last_seen_at (stable IDs + pruning)
+│   ├── 05_embedding_scheme.sql # embedding_scheme column, job attempts/last_error
+│   ├── 06_rule_lifecycle.sql #   retired_at/retired_reason, active-only view + vector index (vendor snapshots)
+│   └── 07_vector_search_settings.sql # hnsw.iterative_scan for the assistant (filtered HNSW keeps its top-k)
 ├── ingestion/
 │   └── parse_disclosure.py   # loads sample rules (runs on the host)
 ├── docs/
@@ -313,9 +317,9 @@ Within a second or two, the worker terminal shows:
 
 ```
 📥 [Event Received] Processing Rule: FEE-FX-001 (Job #1)
-✅ [Worker Action] Rule FEE-FX-001 embedded and cache invalidated.
+✅ [Worker Action] Rule FEE-FX-001 embedded.
 📥 [Event Received] Processing Rule: FEE-LATE-005 (Job #2)
-✅ [Worker Action] Rule FEE-LATE-005 embedded and cache invalidated.
+✅ [Worker Action] Rule FEE-LATE-005 embedded.
 ```
 
 ✅ **Check:** every rule has an embedding and every job is complete.
@@ -382,19 +386,24 @@ docker exec bank_postgres psql -U postgres -d bank_aidb -c "
 
 ### Adding or changing rules
 
-Ingest a document (PDF, TXT, MD or URL), or a whole folder with `--dir`:
+Each run is a **vendor snapshot**: give it all of the vendor's current documents for one tier. Put them in one folder and use `--dir`, or use `--source` when the vendor has a single document:
 
 ```zsh
-python ingestion/parse_disclosure.py --source ~/Downloads/agreement.pdf --vendor HDFC --tier international_credit
+# HDFC's current terms, split across two PDFs
+python ingestion/parse_disclosure.py --dir ~/Downloads/hdfc_2026/ --vendor HDFC --tier international_credit
 ```
 
-Re-running on the same document is safe:
+When the vendor publishes new terms, run the folder again with the new files. The file names don't need to match the old ones.
+
+Re-running is safe:
 
 - **One row per clause.** `rule_id` is `{vendor}-{hash of vendor, tier and normalized clause text}`. The same clause always maps to the same row, even when the model picks a different title or category. Category is stored in its own `category_code` column.
-- **Stale rules are pruned per document.** Each run stamps `last_seen_at` on every rule it extracts. When a document finishes with no failed chunks, rules of that vendor, tier and `source_doc` that the run did not see are deleted. Other documents are never touched. Pass `--no-prune` to keep them.
-- **Failures defer the prune.** If any chunk of a document fails, nothing is pruned for it. The run prints a `--retry-failed <run_dir>` command. Once the retry clears the failures, the deferred prune runs. An interrupted run never prunes, and a run that saved 0 rules for a document refuses to prune it.
-- **Large drops are refused.** If a prune would delete more than half of a document's existing rules (`PRUNE_MAX_DROP_RATIO`), it is skipped with a warning. Under the same file name, that usually means the wrong file was ingested. If the document really was rewritten, re-run with `--force-prune`.
-- **Embeddings only redo what changed.** The trigger re-queues only rules that are new, whose title, domain or clause text changed, or that have no embedding yet. The worker re-embeds them and clears the query cache, so the next questions use the new rules immediately.
+- **Rules no longer in the vendor's documents are retired.** Each run stamps `last_seen_at` on every rule it extracts. When every document finishes with no failures, active rules of that vendor and tier that the run did not see get `retired_at` and a `retired_reason` naming the run and its documents. They disappear from `api.rulebook_vw`, so the assistant stops citing them immediately, but the row stays, so `chat_audit_log.matched_rule_ids` always resolves to the exact clause a customer was given. Other vendors and tiers are never touched. Pass `--no-retire` to keep them active.
+- **Rules can come back.** If a later snapshot contains a retired clause again, the upsert reactivates it. Its embedding was kept, so it is searchable at once.
+- **Failures hold back retiring.** If any chunk fails, nothing is retired. The run prints a `--retry-failed <run_dir>` command, and the retiring step runs once the retry clears every failure. If a whole document could not be read (rejected, unreadable, no text), nothing is retired and the retry can't finish it: fix or remove that file and run the vendor's folder again. An interrupted run never retires, and a run that saved 0 rules refuses to.
+- **Partial snapshots are refused.** If retiring would remove more than half of the vendor's active rules (`PRUNE_MAX_DROP_RATIO`), it is skipped with a warning. That usually means only some of the vendor's documents were given (e.g. just the fee schedule). If the vendor's terms really were rewritten, re-run with `--force-retire`.
+- **To see what was retired:** `SELECT rule_id, rule_title, source_doc, retired_at, retired_reason FROM core.bank_rulebook WHERE retired_at IS NOT NULL ORDER BY retired_at DESC;`
+- **Embeddings only redo what changed.** The trigger re-queues only rules that are new, whose title, domain or clause text changed, or that have no embedding yet. The worker re-embeds them, so the next questions use the new rules immediately.
 
 Inputs are checked for size, page count, download time and relevance before any model call; see [Checks before any LLM call](#checks-before-any-llm-call).
 
@@ -440,12 +449,15 @@ docker exec -it bank_postgres psql -U postgres -d bank_aidb   # SQL shell
 | `OLLAMA_HOST` | `.env` (set by `./ollama-mode.sh`) | `http://127.0.0.1:11434` | Ollama used by the ingestion script. `127.0.0.1` is the native Ollama.app (GPU). `[::1]` is the `bank_ollama` container (CPU) |
 | `CONTAINER_OLLAMA_HOST` | `.env` (set by `./ollama-mode.sh`) | `http://ollama:11434` | Ollama used by the worker and orchestrator. `host.docker.internal` is Ollama.app (GPU). `ollama` is the container (CPU) |
 | `CONFIDENCE_THRESHOLD` | `docker-compose.yml` → `orchestrator` | `0.70` | Minimum cosine similarity needed to answer |
+| `DB_POOL_MAX` / `DB_POOL_MIN` | orchestrator environment | `10` / same as max | Postgres connection pool size. A request borrows a connection only for retrieval and for the audit insert, never during the LLM call; extra requests wait for a free one. Keep `DB_POOL_MAX` × orchestrator replicas below Postgres `max_connections`. Idle connections above `DB_POOL_MIN` are closed, so lowering it trades reconnects for fewer open connections |
 | `EMBED_MODEL` / `MODEL_ID` | `orchestrator/app.py` / `workers/embedding_worker.py` | `nomic-embed-text` | Must match in both files, and must output 768 dimensions (or change `vector(768)` in `sql/03_embeddings_api.sql`) |
+| `QUERY_SCHEME` / `EMBED_SCHEME` | `orchestrator/app.py` / `workers/embedding_worker.py` | `nomic-embed-text\|prefixed-v1` | Keep in step. Bump both when the model or the `search_query: `/`search_document: ` prefixes change; the worker then re-embeds every rule |
+| `EMBED_SWEEP_INTERVAL_S` / `EMBED_SWEEP_BATCH` | worker environment | `60` / `200` | How often the worker looks for rules needing (re-)embedding, and how many it takes per sweep |
 | `CHAT_MODEL` | `orchestrator/app.py` | `llama3.2:3b` | Model that writes the answers |
 | `MAX_SOURCE_MB` / `MAX_PDF_PAGES` | `.env` | `25` / `200` | Largest file or download, and longest PDF, the ingestion script accepts |
 | `DOWNLOAD_DEADLINE_S` | `.env` | `120` | Time limit for a whole URL download |
 | `MIN_RELEVANCE_TERMS` | `.env` | `4` | Distinct card-disclosure terms a source needs to pass the relevance check |
-| `PRUNE_MAX_DROP_RATIO` / `PRUNE_MIN_PRIOR_ROWS` | `.env` | `0.5` / `5` | Largest share of a document's rules a prune may delete, and the minimum document size the check applies to |
+| `PRUNE_MAX_DROP_RATIO` / `PRUNE_MIN_PRIOR_ROWS` | `.env` | `0.5` / `5` | Largest share of a vendor's active rules (per tier) one run may retire, and the minimum rulebook size the check applies to |
 | Query cache TTL | `sql/03_embeddings_api.sql` | 24 hours | How long question embeddings are reused |
 
 ### Switching between GPU and CPU
@@ -490,7 +502,7 @@ Tune it against a realistic set of questions once the rulebook has more than a h
 | `relation "core.bank_rulebook" / "api.…" does not exist` | Volume created before that `sql/` file existed | Apply the file by hand (see [Changing the database schema](#changing-the-database-schema)) or reset the volume |
 | `HTTP 500` from `/api/v1/chat` | Unhandled DB error | `docker logs bank_orchestrator` shows the traceback |
 | `"status": "ERROR"` with `model "…" not found` | Model not pulled | Step 5 |
-| Rules loaded but `embedding` stays `NULL` | Worker not running, or job failed | `docker logs bank_embedding_worker`; check `SELECT * FROM core.embedding_job WHERE status <> 'COMPLETED';` |
+| Rules loaded but `embedding` stays `NULL` | Worker not running, or Ollama failing | `docker logs bank_embedding_worker`; check `SELECT rule_id, status, attempts, last_error FROM core.embedding_job WHERE status <> 'COMPLETED';`. The worker retries on its next sweep (60 s) |
 | Postgres container won't start after an image upgrade, mentions `/var/lib/postgresql/data` | PG 18 images store data under `/var/lib/postgresql/18/docker` | The volume must mount at `/var/lib/postgresql` (already set in `docker-compose.yml`) |
 | `sed: 1: ".env": invalid command code .` | GNU `sed -i` syntax on macOS | Use `sed -i '' '…' file` |
 

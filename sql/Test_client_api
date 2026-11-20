@@ -1,0 +1,20 @@
+SELECT log_id,
+       session_id,
+       customer_tier,
+       user_query,
+       matched_rule_ids,
+       similarity_scores,
+       generated_response,
+       execution_status,
+       latency_ms,
+       created_at
+FROM api.chat_audit_log
+LIMIT 1000;
+
+GRANT SELECT ON api.chat_audit_log TO mcp_assistant;
+
+
+
+SELECT *
+FROM api.chat_audit_log
+LIMIT 1000;

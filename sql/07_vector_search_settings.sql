@@ -1,0 +1,16 @@
+-- Vector search settings for the assistant's role.
+-- Runs automatically on a fresh volume (after 06); on an existing database apply it with:
+--   docker exec -i bank_postgres psql -U postgres -d bank_aidb -v ON_ERROR_STOP=1 < sql/07_vector_search_settings.sql
+-- Idempotent: safe to re-run. Takes effect on NEW connections: restart the orchestrator
+-- afterwards so its connection pool reconnects.
+--
+-- The assistant always filters by vendor + tier. While a vendor's rulebook is small the planner
+-- scans it exactly and this setting does nothing. Once it is large enough for the planner to pick
+-- the HNSW index, plain HNSW first finds the ~ef_search nearest rules across ALL vendors and then
+-- drops other vendors' rows, which can leave fewer than LIMIT rows (measured: 5.1 of 10 returned,
+-- 46% recall, with 10 vendors x 10k rules) and make the assistant wrongly abstain.
+-- Iterative scanning keeps searching until enough rows pass the filter (measured: 10 of 10, 94.5%).
+--
+-- strict_order, not relaxed_order: orchestrator/app.py checks CONFIDENCE_THRESHOLD against the
+-- FIRST row, so rows must come back in exact distance order.
+ALTER ROLE mcp_assistant SET hnsw.iterative_scan = strict_order;

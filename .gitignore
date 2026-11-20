@@ -5706,3 +5706,6 @@ venv/lib/python3.12/site-packages/anyio/streams/__pycache__/stapled.cpython-312-
 venv/lib/python3.12/site-packages/anyio/streams/__pycache__/tls.cpython-312-pytest-8.0.2.pyc
 docs/Rulebook Ingestion Pipeline.pdf
 docs/ingestion-pipeline-summary.pdf
+orchestrator/__pycache__/app.cpython-312.pyc
+tests/__pycache__/test_embedding_scheme.cpython-312-pytest-8.0.2.pyc
+workers/__pycache__/embedding_worker.cpython-312.pyc
